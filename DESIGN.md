@@ -166,6 +166,36 @@ match update {
 }
 ```
 
+## Hot-Reload Config
+
+The bot watches `config.toml` for changes at runtime using the `notify` crate. When the file is modified, the bot re-parses it and applies hot-reloadable fields without restarting.
+
+### Hot-Reloadable Fields (no restart needed)
+
+| Field | Section |
+|-------|---------|
+| `system_prompt` | `[rewrite]` |
+| `chats` | `[rewrite]` |
+| `model` | `[ollama]` |
+| `url` | `[ollama]` |
+
+### Restart-Required Fields
+
+| Field | Section | Why |
+|-------|---------|-----|
+| `api_id` | `[telegram]` | Bound to the Telegram connection at startup |
+| `api_hash` | `[telegram]` | Bound to the Telegram connection at startup |
+| `session_file` | `[telegram]` | Session is opened once at startup |
+| `timeout_seconds` | `[ollama]` | Baked into the HTTP client at construction |
+
+### Mechanism
+
+1. A `notify::RecommendedWatcher` watches the config file's **parent directory** (not the file directly) with `RecursiveMode::NonRecursive`. This handles editors that use atomic rename (vim, neovim) which would break direct file watches on Linux.
+2. On relevant filesystem events (`Modify`, `Create`, `Remove`) matching the config file path, a signal is sent via `tokio::sync::mpsc::unbounded_channel`.
+3. An async task drains the channel (coalescing rapid events), calls `load_hot_config`, and sends the result through a `tokio::sync::watch` channel only if the config actually changed.
+4. The main event loop has a `hot_rx.changed()` arm in `tokio::select!` that rebuilds the `OllamaClient` and updates monitored chats on change.
+5. Invalid configs are logged as warnings and ignored — the bot continues with the previous valid config.
+
 ## Risks & Mitigations
 
 | Risk | Mitigation |

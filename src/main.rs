@@ -2,17 +2,25 @@ mod config;
 mod llm;
 mod telegram;
 
-use crate::config::{Config, ConfigMode, RewriteConfig, load_config_for_mode};
+use crate::config::{
+    Config, ConfigMode, HotConfig, RewriteConfig, extract_hot_config, load_config_for_mode,
+    load_hot_config,
+};
 use crate::llm::OllamaClient;
 use crate::telegram::TelegramBot;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{ArgAction, Parser};
 use grammers_client::Update;
 use grammers_client::types::update::Message as UpdateMessage;
+use notify::{
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{CreateKind, ModifyKind, RemoveKind},
+};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -81,18 +89,170 @@ async fn run_list_mode(config: &Config, query: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn run_rewrite_mode(config: &Config, config_path: &std::path::Path) -> Result<()> {
-    let ollama = config.ollama_required()?.clone();
-    let rewrite = config.rewrite_required()?.clone();
-    let monitored_chats: HashSet<i64> = rewrite.chats.iter().copied().collect();
+struct ActiveRewriteState {
+    hot_config: HotConfig,
+    monitored_chats: HashSet<i64>,
+    llm: OllamaClient,
+}
 
-    let mut bot = TelegramBot::connect_for_rewrite(&config.telegram, monitored_chats).await?;
-    let llm = OllamaClient::new(
-        ollama.url.clone(),
-        ollama.model.clone(),
-        Duration::from_secs(ollama.timeout_seconds),
-    )?;
+impl ActiveRewriteState {
+    fn from_hot_config(hot_config: HotConfig, timeout: Duration) -> Result<Self> {
+        let monitored_chats: HashSet<i64> = hot_config.rewrite.chats.iter().copied().collect();
+        let llm = OllamaClient::new(
+            hot_config.ollama_url.clone(),
+            hot_config.ollama_model.clone(),
+            timeout,
+        )?;
+
+        Ok(Self {
+            hot_config,
+            monitored_chats,
+            llm,
+        })
+    }
+}
+
+fn is_relevant_config_event_kind(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any)
+            | EventKind::Create(CreateKind::File | CreateKind::Any)
+            | EventKind::Remove(RemoveKind::File | RemoveKind::Any)
+            | EventKind::Any
+    )
+}
+
+fn path_targets_watched_config(
+    candidate: &Path,
+    watched_path: &Path,
+    watched_parent: &Path,
+    watched_file_name: &OsStr,
+) -> bool {
+    let resolved_candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        watched_parent.join(candidate)
+    };
+
+    if resolved_candidate == watched_path {
+        return true;
+    }
+
+    if let Ok(canonical_candidate) = resolved_candidate.canonicalize()
+        && canonical_candidate == watched_path
+    {
+        return true;
+    }
+
+    if resolved_candidate.file_name() != Some(watched_file_name) {
+        return false;
+    }
+
+    match resolved_candidate.parent() {
+        Some(parent) if parent == watched_parent => true,
+        Some(parent) => parent
+            .canonicalize()
+            .map(|canonical_parent| canonical_parent == watched_parent)
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+fn event_targets_watched_config(event: &Event, watched_path: &Path, watched_parent: &Path) -> bool {
+    let Some(watched_file_name) = watched_path.file_name() else {
+        return false;
+    };
+
+    event.paths.iter().any(|path| {
+        path_targets_watched_config(path, watched_path, watched_parent, watched_file_name)
+    })
+}
+
+fn spawn_config_watcher(
+    config_path: &Path,
+    hot_tx: watch::Sender<HotConfig>,
+) -> Result<RecommendedWatcher> {
+    let canonical = config_path.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize config path: {}",
+            config_path.display()
+        )
+    })?;
+    let parent = canonical
+        .parent()
+        .context("config path has no parent directory")?
+        .to_owned();
+
+    let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<()>();
+
+    let watched_path = canonical.clone();
+    let watched_parent = parent.clone();
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        let event = match res {
+            Ok(ev) => ev,
+            Err(err) => {
+                warn!(error = %err, "filesystem watcher error");
+                return;
+            }
+        };
+
+        if !is_relevant_config_event_kind(&event.kind) {
+            return;
+        }
+
+        if !event_targets_watched_config(&event, &watched_path, &watched_parent) {
+            return;
+        }
+
+        let _ = notify_tx.send(());
+    })
+    .context("failed to create filesystem watcher")?;
+
+    watcher
+        .watch(&parent, RecursiveMode::NonRecursive)
+        .with_context(|| format!("failed to watch directory: {}", parent.display()))?;
+
+    let reload_path = canonical;
+    tokio::spawn(async move {
+        while notify_rx.recv().await.is_some() {
+            // Coalesce rapid events
+            while notify_rx.try_recv().is_ok() {}
+
+            // Small delay for atomic renames to settle
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            while notify_rx.try_recv().is_ok() {}
+
+            match load_hot_config(&reload_path) {
+                Ok(new_cfg) => {
+                    hot_tx.send_if_modified(|current| {
+                        if *current != new_cfg {
+                            *current = new_cfg;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+                Err(err) => {
+                    warn!(error = %err, "config reload failed; keeping previous config");
+                }
+            }
+        }
+    });
+
+    Ok(watcher)
+}
+
+async fn run_rewrite_mode(config: &Config, config_path: &Path) -> Result<()> {
+    let timeout = Duration::from_secs(config.ollama_required()?.timeout_seconds);
+    let mut active = ActiveRewriteState::from_hot_config(extract_hot_config(config)?, timeout)?;
+
+    let mut bot =
+        TelegramBot::connect_for_rewrite(&config.telegram, active.monitored_chats.clone()).await?;
     let mut dedupe_cache = DedupeCache::new(Duration::from_secs(DEDUPE_TTL_SECONDS));
+
+    let (hot_tx, mut hot_rx) = watch::channel(active.hot_config.clone());
+    let _watcher = spawn_config_watcher(config_path, hot_tx)?;
 
     info!(config_path = %config_path.display(), "brainrot rewriter started");
 
@@ -110,8 +270,8 @@ async fn run_rewrite_mode(config: &Config, config_path: &std::path::Path) -> Res
                     Ok(Update::NewMessage(message)) => {
                         if let Err(err) = process_message(
                             &bot,
-                            &llm,
-                            &rewrite,
+                            &active.llm,
+                            &active.hot_config.rewrite,
                             message,
                             &mut dedupe_cache,
                         ).await {
@@ -120,6 +280,24 @@ async fn run_rewrite_mode(config: &Config, config_path: &std::path::Path) -> Res
                     }
                     Ok(_) => {}
                     Err(err) => warn!(error = %err, "telegram update stream error"),
+                }
+            }
+            Ok(()) = hot_rx.changed() => {
+                let new_hot = hot_rx.borrow_and_update().clone();
+                match ActiveRewriteState::from_hot_config(new_hot, timeout) {
+                    Ok(new_active) => {
+                        bot.update_monitored_chats(new_active.monitored_chats.clone());
+                        info!(
+                            model = %new_active.hot_config.ollama_model,
+                            url = %new_active.hot_config.ollama_url,
+                            chats = ?new_active.hot_config.rewrite.chats,
+                            "config reloaded"
+                        );
+                        active = new_active;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "ignoring config reload; keeping previous active config");
+                    }
                 }
             }
         }
@@ -169,7 +347,7 @@ async fn process_message(
     }
 
     let message_id = message.id();
-    if dedupe_cache.contains(message_id) {
+    if dedupe_cache.contains(chat_id, message_id) {
         debug!(chat_id, message_id, "skipping deduped message");
         return Ok(());
     }
@@ -205,7 +383,7 @@ async fn process_message(
 
     match bot.edit_message(&message, &rewritten).await {
         Ok(()) => {
-            dedupe_cache.insert(message_id);
+            dedupe_cache.insert(chat_id, message_id);
             info!(chat_id, message_id, "rewrote and edited message");
         }
         Err(err) => {
@@ -238,7 +416,7 @@ fn init_tracing() {
 }
 
 struct DedupeCache {
-    entries: HashMap<i32, Instant>,
+    entries: HashMap<(i64, i32), Instant>,
     ttl: Duration,
 }
 
@@ -250,14 +428,14 @@ impl DedupeCache {
         }
     }
 
-    fn contains(&mut self, message_id: i32) -> bool {
+    fn contains(&mut self, chat_id: i64, message_id: i32) -> bool {
         self.evict_expired();
-        self.entries.contains_key(&message_id)
+        self.entries.contains_key(&(chat_id, message_id))
     }
 
-    fn insert(&mut self, message_id: i32) {
+    fn insert(&mut self, chat_id: i64, message_id: i32) {
         self.evict_expired();
-        self.entries.insert(message_id, Instant::now());
+        self.entries.insert((chat_id, message_id), Instant::now());
     }
 
     fn evict_expired(&mut self) {
@@ -268,8 +446,17 @@ impl DedupeCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppMode, parse_args_from};
+    use super::{
+        ActiveRewriteState, AppMode, DedupeCache, event_targets_watched_config,
+        is_relevant_config_event_kind, parse_args_from,
+    };
+    use crate::config::{HotConfig, RewriteConfig};
+    use notify::{
+        Event, EventKind,
+        event::{AccessKind, CreateKind, ModifyKind, RemoveKind},
+    };
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn parse_list_chats_without_query() {
@@ -349,5 +536,128 @@ mod tests {
         let err =
             parse_args_from(["brainrot_tg_llm_rewrite", "work"]).expect_err("parsing should fail");
         assert!(err.to_string().contains("--list-chats"));
+    }
+
+    #[test]
+    fn relevant_config_event_kinds_are_detected() {
+        assert!(is_relevant_config_event_kind(&EventKind::Modify(
+            ModifyKind::Any
+        )));
+        assert!(is_relevant_config_event_kind(&EventKind::Create(
+            CreateKind::Any
+        )));
+        assert!(is_relevant_config_event_kind(&EventKind::Remove(
+            RemoveKind::Any
+        )));
+        assert!(is_relevant_config_event_kind(&EventKind::Any));
+        assert!(!is_relevant_config_event_kind(&EventKind::Access(
+            AccessKind::Any
+        )));
+    }
+
+    #[test]
+    fn event_targets_watched_config_by_exact_path() {
+        let watched_parent = std::env::temp_dir().join("brainrot_watcher_exact_match");
+        std::fs::create_dir_all(&watched_parent).expect("parent should exist");
+        let watched_path = watched_parent.join("config.toml");
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![watched_path.clone()],
+            attrs: Default::default(),
+        };
+        assert!(event_targets_watched_config(
+            &event,
+            &watched_path,
+            &watched_parent
+        ));
+        std::fs::remove_dir_all(&watched_parent).ok();
+    }
+
+    #[test]
+    fn event_targets_watched_config_by_normalized_parent_path() {
+        let watched_parent = std::env::temp_dir().join("brainrot_watcher_normalized_parent");
+        std::fs::create_dir_all(&watched_parent).expect("parent should exist");
+        let watched_path = watched_parent.join("config.toml");
+        let path_with_dot = watched_parent.join(".").join("config.toml");
+        let event = Event {
+            kind: EventKind::Create(CreateKind::Any),
+            paths: vec![path_with_dot],
+            attrs: Default::default(),
+        };
+        assert!(event_targets_watched_config(
+            &event,
+            &watched_path,
+            &watched_parent
+        ));
+        std::fs::remove_dir_all(&watched_parent).ok();
+    }
+
+    #[test]
+    fn event_targets_watched_config_by_relative_path() {
+        let watched_parent = std::env::temp_dir().join("brainrot_watcher_relative_path");
+        std::fs::create_dir_all(&watched_parent).expect("parent should exist");
+        let watched_path = watched_parent.join("config.toml");
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![PathBuf::from("config.toml")],
+            attrs: Default::default(),
+        };
+        assert!(event_targets_watched_config(
+            &event,
+            &watched_path,
+            &watched_parent
+        ));
+        std::fs::remove_dir_all(&watched_parent).ok();
+    }
+
+    #[test]
+    fn event_does_not_target_other_files() {
+        let watched_parent = std::env::temp_dir().join("brainrot_watcher_other_files");
+        std::fs::create_dir_all(&watched_parent).expect("parent should exist");
+        let watched_path = watched_parent.join("config.toml");
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![watched_parent.join("other.toml")],
+            attrs: Default::default(),
+        };
+        assert!(!event_targets_watched_config(
+            &event,
+            &watched_path,
+            &watched_parent
+        ));
+        std::fs::remove_dir_all(&watched_parent).ok();
+    }
+
+    #[test]
+    fn active_rewrite_state_rejects_invalid_ollama_url() {
+        let hot = HotConfig {
+            ollama_url: "not-a-url".to_owned(),
+            ollama_model: "llama3".to_owned(),
+            rewrite: RewriteConfig {
+                chats: vec![-1001234567890],
+                system_prompt: "rewrite this".to_owned(),
+            },
+        };
+        let result = ActiveRewriteState::from_hot_config(hot, Duration::from_secs(5));
+        assert!(result.is_err(), "invalid URL should fail");
+        let err = match result {
+            Ok(_) => unreachable!("checked above"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("valid URL"));
+    }
+
+    #[test]
+    fn dedupe_cache_scopes_entries_by_chat_id() {
+        let mut cache = DedupeCache::new(Duration::from_secs(300));
+        let message_id = 42;
+
+        assert!(!cache.contains(1, message_id));
+        cache.insert(1, message_id);
+        assert!(cache.contains(1, message_id));
+        assert!(
+            !cache.contains(2, message_id),
+            "same message id in another chat must not dedupe"
+        );
     }
 }

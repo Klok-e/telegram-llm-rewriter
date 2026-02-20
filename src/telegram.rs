@@ -124,6 +124,10 @@ impl TelegramBot {
         Ok(chats)
     }
 
+    pub fn update_monitored_chats(&mut self, chats: HashSet<i64>) {
+        self.monitored_chats = chats;
+    }
+
     pub fn is_monitored_chat(&self, chat_id: i64) -> bool {
         self.monitored_chats.contains(&chat_id)
     }
