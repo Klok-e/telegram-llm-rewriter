@@ -381,16 +381,26 @@ async fn process_message(
         return Ok(());
     }
 
-    match bot.edit_message(&message, &rewritten).await {
+    match bot.edit_message(&message, rewritten).await {
         Ok(()) => {
             dedupe_cache.insert(chat_id, message_id);
             info!(chat_id, message_id, "rewrote and edited message");
         }
         Err(err) => {
+            let original_chars = original.chars().count();
+            let rewritten_chars = rewritten.chars().count();
+            let changed_chars_delta = rewritten_chars as i64 - original_chars as i64;
             warn!(
                 chat_id,
                 message_id,
+                original_text = %original,
+                rewritten_text = %rewritten,
+                original_chars,
+                rewritten_chars,
+                changed_chars_delta,
                 error = %err,
+                error_debug = ?err,
+                error_chain = %format_error_chain(&err),
                 "failed to edit message; continuing"
             );
         }
@@ -399,11 +409,18 @@ async fn process_message(
     Ok(())
 }
 
-fn truncate_to_telegram_limit(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_owned();
+fn truncate_to_telegram_limit(input: &str, max_chars: usize) -> &str {
+    match input.char_indices().nth(max_chars) {
+        Some((byte_offset, _)) => &input[..byte_offset],
+        None => input,
     }
-    input.chars().take(max_chars).collect()
+}
+
+fn format_error_chain(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 fn init_tracing() {
@@ -659,5 +676,15 @@ mod tests {
             !cache.contains(2, message_id),
             "same message id in another chat must not dedupe"
         );
+    }
+
+    #[test]
+    fn format_error_chain_includes_all_context_levels() {
+        let err = anyhow::anyhow!("root cause")
+            .context("middle context")
+            .context("outer context");
+
+        let chain = super::format_error_chain(&err);
+        assert_eq!(chain, "outer context -> middle context -> root cause");
     }
 }

@@ -65,9 +65,9 @@ impl TelegramBot {
     pub async fn connect_for_listing(config: &TelegramConfig) -> Result<Self> {
         let ConnectionParts {
             client,
-            updates_rx: _updates_rx,
             pool_handle,
             pool_task,
+            ..
         } = connect_and_auth(config).await?;
 
         Ok(Self {
@@ -102,12 +102,10 @@ impl TelegramBot {
         {
             let peer = dialog.peer();
             let name = peer.name().unwrap_or_default().trim().to_owned();
-            let name_lower = name.to_lowercase();
-            let include = query
+            let matches = query
                 .as_ref()
-                .map(|query| name_lower.contains(query))
-                .unwrap_or(true);
-            if include {
+                .is_none_or(|q| name.to_lowercase().contains(q));
+            if matches {
                 chats.push(ChatListItem {
                     id: peer.id().bot_api_dialog_id(),
                     name,
@@ -137,8 +135,18 @@ impl TelegramBot {
     }
 
     pub async fn edit_message(&self, message: &UpdateMessage, new_text: &str) -> Result<()> {
-        message
-            .edit(new_text)
+        let message_id = message.id();
+        let peer = match message.peer() {
+            Ok(peer) => peer.clone(),
+            Err(peer_ref) => self
+                .client
+                .resolve_peer(peer_ref)
+                .await
+                .context("failed to resolve peer for Telegram message edit")?,
+        };
+
+        self.client
+            .edit_message(peer, message_id, new_text)
             .await
             .context("failed to edit Telegram message")?;
         Ok(())

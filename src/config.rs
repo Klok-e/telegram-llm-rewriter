@@ -143,19 +143,7 @@ pub fn extract_hot_config(config: &Config) -> Result<HotConfig> {
 }
 
 pub fn load_hot_config(path: &Path) -> Result<HotConfig> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config file: {}", path.display()))?;
-    let config: Config = toml::from_str(&raw).context("failed to parse config TOML")?;
-    let ollama = config
-        .ollama
-        .as_ref()
-        .context("missing required [ollama] section")?;
-    validate_ollama_config(ollama)?;
-    let rewrite = config
-        .rewrite
-        .as_ref()
-        .context("missing required [rewrite] section")?;
-    validate_rewrite_config(rewrite)?;
+    let config = load_config_for_mode(path, ConfigMode::Rewrite)?;
     extract_hot_config(&config)
 }
 
