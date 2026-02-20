@@ -30,7 +30,7 @@ The user sees their message briefly in its original form, then it gets replaced 
 
 1. **Telegram Client** — MTProto userbot using the `grammers` crate (pure Rust, no C dependencies unlike TDLib)
 2. **LLM Client** — HTTP client talking to a local Ollama instance
-3. **Config** — TOML file for chat IDs, Ollama endpoint, model name, and system prompt
+3. **Config** — TOML file for chat IDs, Ollama endpoint, model name, timeout, and system prompt
 
 ### Crate Dependencies
 
@@ -66,10 +66,11 @@ session_file = "session.bin"
 [ollama]
 url = "http://localhost:11434"
 model = "llama3"
+timeout_seconds = 20
 
 [rewrite]
 # Chat IDs to monitor (negative for groups/supergroups).
-chat_ids = [-1001234567890]
+chats = [-1001234567890]
 
 # The system prompt that controls the rewrite style.
 system_prompt = """
@@ -91,7 +92,7 @@ or academic paper. Reply with ONLY the rewritten message, nothing else.
 - Set up `tracing` logging
 
 ### Phase 2: Ollama client
-- Implement `POST /api/generate` call to Ollama
+- Implement `POST /api/chat` call to Ollama
 - Send system prompt + user message, return generated text
 - Handle errors and timeouts gracefully
 
@@ -112,7 +113,7 @@ or academic paper. Reply with ONLY the rewritten message, nothing else.
 - Graceful shutdown on Ctrl+C
 - Retry logic for Ollama (connection refused, model loading)
 - Skip editing if the rewrite is identical or empty
-- Optionally prefix rewritten messages (e.g., a subtle marker) so you know which ones were rewritten
+- Use a dedupe cache keyed by message ID to prevent self-trigger loops
 
 ## Key Design Decisions
 
