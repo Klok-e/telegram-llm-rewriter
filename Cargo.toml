@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
 grammers-client = "0.8.1"
 grammers-mtsender = "0.8.1"
 grammers-session = "0.8.0"

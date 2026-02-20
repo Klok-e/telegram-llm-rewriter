@@ -2,13 +2,15 @@ mod config;
 mod llm;
 mod telegram;
 
-use crate::config::{RewriteConfig, load_config};
+use crate::config::{Config, ConfigMode, RewriteConfig, load_config_for_mode};
 use crate::llm::OllamaClient;
 use crate::telegram::TelegramBot;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use clap::{ArgAction, Parser};
 use grammers_client::Update;
 use grammers_client::types::update::Message as UpdateMessage;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -18,22 +20,77 @@ const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const TELEGRAM_MESSAGE_MAX_CHARS: usize = 4096;
 const DEDUPE_TTL_SECONDS: u64 = 300;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppMode {
+    Rewrite,
+    ListChats { query: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppArgs {
+    config_path: PathBuf,
+    mode: AppMode,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "brainrot_tg_llm_rewrite")]
+#[command(about = "Telegram userbot rewriter with optional chat listing mode")]
+struct Cli {
+    #[arg(long, value_name = "path", default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+    #[arg(long, action = ArgAction::SetTrue)]
+    list_chats: bool,
+    #[arg(value_name = "query", requires = "list_chats")]
+    query: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let config_path = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
-    let config = load_config(&config_path)?;
-    let monitored_chats: HashSet<i64> = config.rewrite.chats.iter().copied().collect();
+    let args = parse_args()?;
+    let config_mode = match args.mode {
+        AppMode::Rewrite => ConfigMode::Rewrite,
+        AppMode::ListChats { .. } => ConfigMode::ListChats,
+    };
+    let config = load_config_for_mode(&args.config_path, config_mode)?;
 
-    let mut bot = TelegramBot::connect_and_authorize(&config.telegram, monitored_chats).await?;
+    match args.mode {
+        AppMode::ListChats { query } => run_list_mode(&config, query.as_deref()).await,
+        AppMode::Rewrite => run_rewrite_mode(&config, &args.config_path).await,
+    }
+}
+
+async fn run_list_mode(config: &Config, query: Option<&str>) -> Result<()> {
+    let mut bot = TelegramBot::connect_for_listing(&config.telegram).await?;
+    let chats = bot.list_chats(query).await?;
+
+    if chats.is_empty() {
+        if let Some(query) = query {
+            println!("No chats matched filter: {query}");
+        } else {
+            println!("No chats found.");
+        }
+    } else {
+        for chat in chats {
+            println!("{}\t{}", chat.id, chat.name);
+        }
+    }
+
+    bot.shutdown().await?;
+    Ok(())
+}
+
+async fn run_rewrite_mode(config: &Config, config_path: &std::path::Path) -> Result<()> {
+    let ollama = config.ollama_required()?.clone();
+    let rewrite = config.rewrite_required()?.clone();
+    let monitored_chats: HashSet<i64> = rewrite.chats.iter().copied().collect();
+
+    let mut bot = TelegramBot::connect_for_rewrite(&config.telegram, monitored_chats).await?;
     let llm = OllamaClient::new(
-        config.ollama.url.clone(),
-        config.ollama.model.clone(),
-        Duration::from_secs(config.ollama.timeout_seconds),
+        ollama.url.clone(),
+        ollama.model.clone(),
+        Duration::from_secs(ollama.timeout_seconds),
     )?;
     let mut dedupe_cache = DedupeCache::new(Duration::from_secs(DEDUPE_TTL_SECONDS));
 
@@ -54,7 +111,7 @@ async fn main() -> Result<()> {
                         if let Err(err) = process_message(
                             &bot,
                             &llm,
-                            &config.rewrite,
+                            &rewrite,
                             message,
                             &mut dedupe_cache,
                         ).await {
@@ -71,6 +128,28 @@ async fn main() -> Result<()> {
     bot.shutdown().await?;
 
     Ok(())
+}
+
+fn parse_args() -> Result<AppArgs> {
+    parse_args_from(std::env::args_os())
+}
+
+fn parse_args_from<I, S>(args: I) -> Result<AppArgs>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString> + Clone,
+{
+    let cli = Cli::try_parse_from(args).map_err(|error| anyhow!(error.to_string()))?;
+    let mode = if cli.list_chats {
+        AppMode::ListChats { query: cli.query }
+    } else {
+        AppMode::Rewrite
+    };
+
+    Ok(AppArgs {
+        config_path: cli.config,
+        mode,
+    })
 }
 
 async fn process_message(
@@ -184,5 +263,91 @@ impl DedupeCache {
     fn evict_expired(&mut self) {
         let ttl = self.ttl;
         self.entries.retain(|_, seen_at| seen_at.elapsed() <= ttl);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppMode, parse_args_from};
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_list_chats_without_query() {
+        let parsed = parse_args_from(["brainrot_tg_llm_rewrite", "--list-chats"])
+            .expect("parsing should succeed");
+        assert_eq!(parsed.mode, AppMode::ListChats { query: None });
+    }
+
+    #[test]
+    fn parse_list_chats_with_query() {
+        let parsed = parse_args_from(["brainrot_tg_llm_rewrite", "--list-chats", "work"])
+            .expect("parsing should succeed");
+        assert_eq!(
+            parsed.mode,
+            AppMode::ListChats {
+                query: Some("work".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_config_path() {
+        let parsed = parse_args_from(["brainrot_tg_llm_rewrite", "--config", "custom.toml"])
+            .expect("parsing should succeed");
+        assert_eq!(parsed.config_path, PathBuf::from("custom.toml"));
+        assert_eq!(parsed.mode, AppMode::Rewrite);
+    }
+
+    #[test]
+    fn parse_missing_config_path_fails() {
+        let err = parse_args_from(["brainrot_tg_llm_rewrite", "--config"])
+            .expect_err("parsing should fail");
+        assert!(err.to_string().contains("--config"));
+    }
+
+    #[test]
+    fn parse_unknown_flag_fails() {
+        let err =
+            parse_args_from(["brainrot_tg_llm_rewrite", "--wat"]).expect_err("parsing should fail");
+        assert!(err.to_string().contains("--wat"));
+    }
+
+    #[test]
+    fn parse_config_then_list_mode_with_query() {
+        let parsed = parse_args_from([
+            "brainrot_tg_llm_rewrite",
+            "--config",
+            "x.toml",
+            "--list-chats",
+            "team",
+        ])
+        .expect("parsing should succeed");
+        assert_eq!(parsed.config_path, PathBuf::from("x.toml"));
+        assert_eq!(
+            parsed.mode,
+            AppMode::ListChats {
+                query: Some("team".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_list_mode_then_config_without_query() {
+        let parsed = parse_args_from([
+            "brainrot_tg_llm_rewrite",
+            "--list-chats",
+            "--config",
+            "x.toml",
+        ])
+        .expect("parsing should succeed");
+        assert_eq!(parsed.config_path, PathBuf::from("x.toml"));
+        assert_eq!(parsed.mode, AppMode::ListChats { query: None });
+    }
+
+    #[test]
+    fn parse_query_without_list_mode_fails() {
+        let err =
+            parse_args_from(["brainrot_tg_llm_rewrite", "work"]).expect_err("parsing should fail");
+        assert!(err.to_string().contains("--list-chats"));
     }
 }

@@ -2,7 +2,7 @@
 
 ## Overview
 
-A Telegram **userbot** (runs as your personal account) that intercepts your outgoing messages in configured chats, rewrites them through a local LLM (Ollama), and edits the original message with the rewritten version. Default style: verbose and formal. The rewrite prompt is fully configurable.
+A Telegram **userbot** (runs as your personal account) that intercepts your outgoing messages in configured chats, rewrites them through a local LLM (Ollama), and edits the original message with the rewritten version. Default style: verbose and formal. The rewrite prompt is fully configurable. The binary also supports `--list-chats [query]` to print visible chat IDs and names for setup.
 
 ## How It Works
 
@@ -30,7 +30,7 @@ The user sees their message briefly in its original form, then it gets replaced 
 
 1. **Telegram Client** — MTProto userbot using the `grammers` crate (pure Rust, no C dependencies unlike TDLib)
 2. **LLM Client** — HTTP client talking to a local Ollama instance
-3. **Config** — TOML file for chat IDs, Ollama endpoint, model name, timeout, and system prompt
+3. **Config** — TOML file for Telegram auth and rewrite settings
 
 ### Crate Dependencies
 
@@ -83,6 +83,17 @@ or academic paper. Reply with ONLY the rewritten message, nothing else.
 
 `api_id` and `api_hash` are obtained from https://my.telegram.org.
 
+For `--list-chats` mode, only the `[telegram]` section is required.
+
+## CLI
+
+```text
+brainrot_tg_llm_rewrite [--config <path>] [--list-chats [query]]
+```
+
+- `--config <path>`: override config path (default `config.toml`)
+- `--list-chats [query]`: list visible chats as `<id>\t<name>`, optionally filtered by case-insensitive name contains
+
 ## Implementation Plan
 
 ### Phase 1: Project skeleton & config
@@ -123,7 +134,7 @@ or academic paper. Reply with ONLY the rewritten message, nothing else.
 
 3. **Ollama over cloud APIs** — No API keys, no costs, full privacy. Runs locally. The user can swap models freely.
 
-4. **TOML config over CLI args** — The system prompt and chat list are too complex for CLI flags. A config file is more ergonomic.
+4. **TOML config + focused CLI flags** — Rewrite behavior lives in TOML, while discovery/setup uses simple flags (`--config`, `--list-chats`).
 
 ## Outgoing Message Detection (Verified)
 
@@ -147,7 +158,7 @@ Detecting outgoing messages with `grammers` is confirmed to work. Evidence:
 ```rust
 match update {
     Update::NewMessage(message) if message.outgoing() => {
-        if message.chat().id() == target_chat_id {
+        if message.peer_id().bot_api_dialog_id() == target_chat_id {
             // rewrite this message
         }
     }
