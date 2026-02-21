@@ -16,7 +16,6 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(api_key: String, model: String, timeout: Duration) -> Result<Self> {
-        dbg!(&api_key);
         let api_key = api_key.trim().to_owned();
         if api_key.is_empty() {
             bail!("openai api key must not be empty");
