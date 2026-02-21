@@ -519,6 +519,37 @@ async fn process_message(
         }
     }
 
+    let llm_context: Vec<String> = context
+        .iter()
+        .map(ContextMessage::as_llm_user_content)
+        .collect();
+    let pretty_system_prompt = rewrite.system_prompt.replace('\n', "\n    ");
+    let pretty_input = original.replace('\n', "\n    ");
+    let pretty_context = if llm_context.is_empty() {
+        "    (none)".to_owned()
+    } else {
+        llm_context
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let entry = entry.replace('\n', "\n         ");
+                format!("    {:02}. {}", idx + 1, entry)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    info!(
+        chat_id,
+        topic_root_id = ?topic_root_id,
+        message_id,
+        context_messages = llm_context.len(),
+        model_call_enabled = runtime.rewrite_override.is_none(),
+        "prepared rewrite payload\n  system_prompt:\n    {}\n  context:\n{}\n  input:\n    {}",
+        pretty_system_prompt,
+        pretty_context,
+        pretty_input
+    );
+
     let rewritten = if let Some(override_text) = runtime.rewrite_override {
         debug!(chat_id, message_id, "using test rewrite override text");
         override_text.to_owned()
