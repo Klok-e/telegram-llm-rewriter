@@ -1,10 +1,13 @@
 use crate::config::TelegramConfig;
+use crate::context::{ContextMessage, resolve_sender_name};
 use anyhow::{Context, Result, bail};
-use grammers_client::client::updates::{UpdateStream, UpdatesLike};
-use grammers_client::types::update::Message as UpdateMessage;
-use grammers_client::{Client, SignInError, Update, UpdatesConfiguration};
-use grammers_mtsender::{SenderPool, SenderPoolHandle};
+use grammers_client::client::{UpdateStream, UpdatesConfiguration};
+use grammers_client::update::{Message as UpdateMessage, Update};
+use grammers_client::{Client, SignInError};
+use grammers_mtsender::{SenderPool, SenderPoolFatHandle};
 use grammers_session::storages::SqliteSession;
+use grammers_session::types::PeerRef;
+use grammers_session::updates::UpdatesLike;
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -16,7 +19,7 @@ pub struct TelegramBot {
     client: Client,
     updates: Option<UpdateStream>,
     monitored_chats: HashSet<i64>,
-    pool_handle: SenderPoolHandle,
+    pool_handle: SenderPoolFatHandle,
     pool_task: Option<JoinHandle<()>>,
 }
 
@@ -29,7 +32,7 @@ pub struct ChatListItem {
 struct ConnectionParts {
     client: Client,
     updates_rx: UnboundedReceiver<UpdatesLike>,
-    pool_handle: SenderPoolHandle,
+    pool_handle: SenderPoolFatHandle,
     pool_task: JoinHandle<()>,
 }
 
@@ -45,13 +48,15 @@ impl TelegramBot {
             pool_task,
         } = connect_and_auth(config).await?;
 
-        let updates = client.stream_updates(
-            updates_rx,
-            UpdatesConfiguration {
-                catch_up: false,
-                ..Default::default()
-            },
-        );
+        let updates = client
+            .stream_updates(
+                updates_rx,
+                UpdatesConfiguration {
+                    catch_up: false,
+                    ..Default::default()
+                },
+            )
+            .await;
 
         Ok(Self {
             client,
@@ -93,7 +98,7 @@ impl TelegramBot {
     pub async fn list_chats(&self, query: Option<&str>) -> Result<Vec<ChatListItem>> {
         let query = query.map(|value| value.to_lowercase());
         let mut dialogs = self.client.iter_dialogs();
-        let mut chats = Vec::new();
+        let mut chats: Vec<(String, ChatListItem)> = Vec::new();
 
         while let Some(dialog) = dialogs
             .next()
@@ -102,24 +107,21 @@ impl TelegramBot {
         {
             let peer = dialog.peer();
             let name = peer.name().unwrap_or_default().trim().to_owned();
-            let matches = query
-                .as_ref()
-                .is_none_or(|q| name.to_lowercase().contains(q));
+            let name_lower = name.to_lowercase();
+            let matches = query.as_ref().is_none_or(|q| name_lower.contains(q));
             if matches {
-                chats.push(ChatListItem {
-                    id: peer.id().bot_api_dialog_id(),
-                    name,
-                });
+                chats.push((
+                    name_lower,
+                    ChatListItem {
+                        id: peer.id().bot_api_dialog_id(),
+                        name,
+                    },
+                ));
             }
         }
 
-        chats.sort_by(|left, right| {
-            left.name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase())
-                .then(left.id.cmp(&right.id))
-        });
-        Ok(chats)
+        chats.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.id.cmp(&right.1.id)));
+        Ok(chats.into_iter().map(|(_, item)| item).collect())
     }
 
     pub fn update_monitored_chats(&mut self, chats: HashSet<i64>) {
@@ -130,20 +132,12 @@ impl TelegramBot {
         self.monitored_chats.contains(&chat_id)
     }
 
-    pub fn chat_id_for_message(&self, message: &UpdateMessage) -> i64 {
-        message.peer_id().bot_api_dialog_id()
-    }
-
     pub async fn edit_message(&self, message: &UpdateMessage, new_text: &str) -> Result<()> {
         let message_id = message.id();
-        let peer = match message.peer() {
-            Ok(peer) => peer.clone(),
-            Err(peer_ref) => self
-                .client
-                .resolve_peer(peer_ref)
-                .await
-                .context("failed to resolve peer for Telegram message edit")?,
-        };
+        let peer = message
+            .peer_ref()
+            .await
+            .context("failed to resolve peer for Telegram message edit")?;
 
         self.client
             .edit_message(peer, message_id, new_text)
@@ -152,9 +146,54 @@ impl TelegramBot {
         Ok(())
     }
 
+    pub async fn fetch_context(
+        &self,
+        message: &UpdateMessage,
+        count: usize,
+    ) -> Result<Vec<ContextMessage>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let peer_ref: PeerRef = message
+            .peer_ref()
+            .await
+            .context("failed to resolve peer for fetching context")?;
+
+        let message_id = message.id();
+        let mut iter = self.client.iter_messages(peer_ref);
+        let mut messages = Vec::new();
+
+        while let Some(msg) = iter
+            .next()
+            .await
+            .context("failed while iterating messages for context")?
+        {
+            if msg.id() == message_id {
+                continue;
+            }
+
+            let text = msg.text().trim().to_owned();
+            if text.is_empty() {
+                continue;
+            }
+
+            let peer_name = msg.sender().and_then(|p| p.name().map(str::to_owned));
+            let sender_name = resolve_sender_name(msg.outgoing(), peer_name.as_deref());
+            messages.push(ContextMessage { sender_name, text });
+
+            if messages.len() >= count {
+                break;
+            }
+        }
+
+        messages.reverse();
+        Ok(messages)
+    }
+
     pub async fn shutdown(&mut self) -> Result<()> {
-        if let Some(updates) = self.updates.as_mut() {
-            updates.sync_update_state();
+        if let Some(updates) = self.updates.as_ref() {
+            updates.sync_update_state().await;
         }
         self.pool_handle.quit();
         if let Some(pool_task) = self.pool_task.take() {
@@ -167,15 +206,19 @@ impl TelegramBot {
 }
 
 async fn connect_and_auth(config: &TelegramConfig) -> Result<ConnectionParts> {
-    let session = Arc::new(SqliteSession::open(&config.session_file).with_context(|| {
-        format!(
-            "failed to open session db: {}",
-            config.session_file.display()
-        )
-    })?);
+    let session = Arc::new(
+        SqliteSession::open(&config.session_file)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open session db: {}",
+                    config.session_file.display()
+                )
+            })?,
+    );
 
     let pool = SenderPool::new(Arc::clone(&session), config.api_id);
-    let client = Client::new(&pool);
+    let client = Client::new(pool.handle.clone());
     let SenderPool {
         runner,
         updates,
@@ -210,7 +253,7 @@ async fn sign_in_interactively(client: &Client, api_hash: &str) -> Result<()> {
 
     match client.sign_in(&login_token, code.trim()).await {
         Ok(user) => {
-            info!(user_id = user.bare_id(), "Telegram sign-in successful");
+            info!(user_id = user.id().bare_id(), "Telegram sign-in successful");
             Ok(())
         }
         Err(SignInError::PasswordRequired(password_token)) => {
@@ -221,7 +264,7 @@ async fn sign_in_interactively(client: &Client, api_hash: &str) -> Result<()> {
                 .context("failed to validate Telegram 2FA password")?;
             Ok(())
         }
-        Err(SignInError::SignUpRequired { .. }) => {
+        Err(SignInError::SignUpRequired) => {
             bail!("this Telegram account must be registered in an official client first")
         }
         Err(err) => Err(err).context("Telegram sign-in failed"),

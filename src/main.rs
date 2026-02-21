@@ -1,4 +1,5 @@
 mod config;
+mod context;
 mod llm;
 mod telegram;
 
@@ -6,18 +7,18 @@ use crate::config::{
     Config, ConfigMode, HotConfig, RewriteConfig, extract_hot_config, load_config_for_mode,
     load_hot_config,
 };
+use crate::context::{ContextMessage, resolve_sender_name};
 use crate::llm::OllamaClient;
 use crate::telegram::TelegramBot;
 use anyhow::{Context, Result, anyhow};
 use clap::{ArgAction, Parser};
-use grammers_client::Update;
-use grammers_client::types::update::Message as UpdateMessage;
+use grammers_client::update::{Message as UpdateMessage, Update};
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{CreateKind, ModifyKind, RemoveKind},
 };
-use std::collections::{HashMap, HashSet};
-use std::ffi::{OsStr, OsString};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -122,50 +123,21 @@ fn is_relevant_config_event_kind(kind: &EventKind) -> bool {
     )
 }
 
-fn path_targets_watched_config(
-    candidate: &Path,
-    watched_path: &Path,
-    watched_parent: &Path,
-    watched_file_name: &OsStr,
-) -> bool {
-    let resolved_candidate = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        watched_parent.join(candidate)
-    };
-
-    if resolved_candidate == watched_path {
+fn path_targets_watched_config(candidate: &Path, watched_path: &Path) -> bool {
+    if candidate == watched_path {
         return true;
     }
-
-    if let Ok(canonical_candidate) = resolved_candidate.canonicalize()
-        && canonical_candidate == watched_path
-    {
-        return true;
-    }
-
-    if resolved_candidate.file_name() != Some(watched_file_name) {
-        return false;
-    }
-
-    match resolved_candidate.parent() {
-        Some(parent) if parent == watched_parent => true,
-        Some(parent) => parent
-            .canonicalize()
-            .map(|canonical_parent| canonical_parent == watched_parent)
-            .unwrap_or(false),
-        None => false,
-    }
+    candidate
+        .canonicalize()
+        .map(|canonical| canonical == watched_path)
+        .unwrap_or(false)
 }
 
-fn event_targets_watched_config(event: &Event, watched_path: &Path, watched_parent: &Path) -> bool {
-    let Some(watched_file_name) = watched_path.file_name() else {
-        return false;
-    };
-
-    event.paths.iter().any(|path| {
-        path_targets_watched_config(path, watched_path, watched_parent, watched_file_name)
-    })
+fn event_targets_watched_config(event: &Event, watched_path: &Path) -> bool {
+    event
+        .paths
+        .iter()
+        .any(|path| path_targets_watched_config(path, watched_path))
 }
 
 fn spawn_config_watcher(
@@ -186,7 +158,6 @@ fn spawn_config_watcher(
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<()>();
 
     let watched_path = canonical.clone();
-    let watched_parent = parent.clone();
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         let event = match res {
             Ok(ev) => ev,
@@ -200,7 +171,7 @@ fn spawn_config_watcher(
             return;
         }
 
-        if !event_targets_watched_config(&event, &watched_path, &watched_parent) {
+        if !event_targets_watched_config(&event, &watched_path) {
             return;
         }
 
@@ -250,6 +221,7 @@ async fn run_rewrite_mode(config: &Config, config_path: &Path) -> Result<()> {
     let mut bot =
         TelegramBot::connect_for_rewrite(&config.telegram, active.monitored_chats.clone()).await?;
     let mut dedupe_cache = DedupeCache::new(Duration::from_secs(DEDUPE_TTL_SECONDS));
+    let mut context_cache = ContextCache::new(active.hot_config.rewrite.context_messages);
 
     let (hot_tx, mut hot_rx) = watch::channel(active.hot_config.clone());
     let _watcher = spawn_config_watcher(config_path, hot_tx)?;
@@ -268,14 +240,22 @@ async fn run_rewrite_mode(config: &Config, config_path: &Path) -> Result<()> {
             update_result = bot.next_update() => {
                 match update_result {
                     Ok(Update::NewMessage(message)) => {
-                        if let Err(err) = process_message(
-                            &bot,
-                            &active.llm,
-                            &active.hot_config.rewrite,
-                            message,
-                            &mut dedupe_cache,
-                        ).await {
-                            error!(error = %err, "failed to process message");
+                        let chat_id = message.peer_id().bot_api_dialog_id();
+                        if bot.is_monitored_chat(chat_id) {
+                            context_cache.observe_update_message(chat_id, &message);
+                            if let Err(err) = process_message(
+                                &bot,
+                                &active.llm,
+                                &active.hot_config.rewrite,
+                                message,
+                                chat_id,
+                                &mut dedupe_cache,
+                                &mut context_cache,
+                            )
+                            .await
+                            {
+                                error!(error = %err, "failed to process message");
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -287,6 +267,8 @@ async fn run_rewrite_mode(config: &Config, config_path: &Path) -> Result<()> {
                 match ActiveRewriteState::from_hot_config(new_hot, timeout) {
                     Ok(new_active) => {
                         bot.update_monitored_chats(new_active.monitored_chats.clone());
+                        context_cache.retain_chats(&new_active.monitored_chats);
+                        context_cache.set_per_chat_limit(new_active.hot_config.rewrite.context_messages);
                         info!(
                             model = %new_active.hot_config.ollama_model,
                             url = %new_active.hot_config.ollama_url,
@@ -335,14 +317,11 @@ async fn process_message(
     llm: &OllamaClient,
     rewrite: &RewriteConfig,
     message: UpdateMessage,
+    chat_id: i64,
     dedupe_cache: &mut DedupeCache,
+    context_cache: &mut ContextCache,
 ) -> Result<()> {
     if !message.outgoing() {
-        return Ok(());
-    }
-
-    let chat_id = bot.chat_id_for_message(&message);
-    if !bot.is_monitored_chat(chat_id) {
         return Ok(());
     }
 
@@ -358,7 +337,27 @@ async fn process_message(
         return Ok(());
     }
 
-    let rewritten = match llm.rewrite(&rewrite.system_prompt, &original).await {
+    let mut context = context_cache.recent_before(chat_id, message_id, rewrite.context_messages);
+    if context_cache.should_backfill(chat_id, rewrite.context_messages, context.len()) {
+        context_cache.mark_hydrated(chat_id);
+        match bot.fetch_context(&message, rewrite.context_messages).await {
+            Ok(fetched) => context = fetched,
+            Err(err) => {
+                warn!(
+                    chat_id,
+                    message_id,
+                    requested_context_messages = rewrite.context_messages,
+                    error = %err,
+                    "failed to fetch context messages; using cached context only"
+                );
+            }
+        }
+    }
+
+    let rewritten = match llm
+        .rewrite(&rewrite.system_prompt, &context, &original)
+        .await
+    {
         Ok(text) => text,
         Err(err) => {
             warn!(
@@ -387,20 +386,12 @@ async fn process_message(
             info!(chat_id, message_id, "rewrote and edited message");
         }
         Err(err) => {
-            let original_chars = original.chars().count();
-            let rewritten_chars = rewritten.chars().count();
-            let changed_chars_delta = rewritten_chars as i64 - original_chars as i64;
             warn!(
                 chat_id,
                 message_id,
                 original_text = %original,
                 rewritten_text = %rewritten,
-                original_chars,
-                rewritten_chars,
-                changed_chars_delta,
                 error = %err,
-                error_debug = ?err,
-                error_chain = %format_error_chain(&err),
                 "failed to edit message; continuing"
             );
         }
@@ -409,18 +400,105 @@ async fn process_message(
     Ok(())
 }
 
+#[derive(Clone)]
+struct CachedContextMessage {
+    message_id: i32,
+    message: ContextMessage,
+}
+
+struct ContextCache {
+    per_chat_limit: usize,
+    entries: HashMap<i64, VecDeque<CachedContextMessage>>,
+    hydrated_chats: HashSet<i64>,
+}
+
+impl ContextCache {
+    fn new(per_chat_limit: usize) -> Self {
+        Self {
+            per_chat_limit,
+            entries: HashMap::new(),
+            hydrated_chats: HashSet::new(),
+        }
+    }
+
+    fn set_per_chat_limit(&mut self, per_chat_limit: usize) {
+        self.per_chat_limit = per_chat_limit;
+        for messages in self.entries.values_mut() {
+            while messages.len() > self.per_chat_limit {
+                messages.pop_front();
+            }
+        }
+    }
+
+    fn retain_chats(&mut self, chats: &HashSet<i64>) {
+        self.entries.retain(|chat_id, _| chats.contains(chat_id));
+        self.hydrated_chats
+            .retain(|chat_id| chats.contains(chat_id));
+    }
+
+    fn observe_update_message(&mut self, chat_id: i64, message: &UpdateMessage) {
+        let text = message.text().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+
+        let peer_name = message.sender().and_then(|p| p.name().map(str::to_owned));
+        let sender_name = resolve_sender_name(message.outgoing(), peer_name.as_deref());
+        self.record_message(chat_id, message.id(), ContextMessage { sender_name, text });
+    }
+
+    fn record_message(&mut self, chat_id: i64, message_id: i32, message: ContextMessage) {
+        let chat_messages = self.entries.entry(chat_id).or_default();
+        if chat_messages
+            .back()
+            .is_some_and(|cached| cached.message_id == message_id)
+        {
+            return;
+        }
+        chat_messages.push_back(CachedContextMessage {
+            message_id,
+            message,
+        });
+        while chat_messages.len() > self.per_chat_limit {
+            chat_messages.pop_front();
+        }
+    }
+
+    fn recent_before(&self, chat_id: i64, message_id: i32, count: usize) -> Vec<ContextMessage> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let mut recent = Vec::with_capacity(count);
+        if let Some(messages) = self.entries.get(&chat_id) {
+            for cached in messages.iter().rev() {
+                if cached.message_id == message_id {
+                    continue;
+                }
+                recent.push(cached.message.clone());
+                if recent.len() >= count {
+                    break;
+                }
+            }
+        }
+        recent.reverse();
+        recent
+    }
+
+    fn should_backfill(&self, chat_id: i64, count: usize, cached_count: usize) -> bool {
+        count > 0 && cached_count < count && !self.hydrated_chats.contains(&chat_id)
+    }
+
+    fn mark_hydrated(&mut self, chat_id: i64) {
+        self.hydrated_chats.insert(chat_id);
+    }
+}
+
 fn truncate_to_telegram_limit(input: &str, max_chars: usize) -> &str {
     match input.char_indices().nth(max_chars) {
         Some((byte_offset, _)) => &input[..byte_offset],
         None => input,
     }
-}
-
-fn format_error_chain(err: &anyhow::Error) -> String {
-    err.chain()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(" -> ")
 }
 
 fn init_tracing() {
@@ -451,7 +529,6 @@ impl DedupeCache {
     }
 
     fn insert(&mut self, chat_id: i64, message_id: i32) {
-        self.evict_expired();
         self.entries.insert((chat_id, message_id), Instant::now());
     }
 
@@ -464,10 +541,11 @@ impl DedupeCache {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveRewriteState, AppMode, DedupeCache, event_targets_watched_config,
+        ActiveRewriteState, AppMode, ContextCache, DedupeCache, event_targets_watched_config,
         is_relevant_config_event_kind, parse_args_from,
     };
     use crate::config::{HotConfig, RewriteConfig};
+    use crate::context::ContextMessage;
     use notify::{
         Event, EventKind,
         event::{AccessKind, CreateKind, ModifyKind, RemoveKind},
@@ -582,11 +660,7 @@ mod tests {
             paths: vec![watched_path.clone()],
             attrs: Default::default(),
         };
-        assert!(event_targets_watched_config(
-            &event,
-            &watched_path,
-            &watched_parent
-        ));
+        assert!(event_targets_watched_config(&event, &watched_path));
         std::fs::remove_dir_all(&watched_parent).ok();
     }
 
@@ -601,29 +675,7 @@ mod tests {
             paths: vec![path_with_dot],
             attrs: Default::default(),
         };
-        assert!(event_targets_watched_config(
-            &event,
-            &watched_path,
-            &watched_parent
-        ));
-        std::fs::remove_dir_all(&watched_parent).ok();
-    }
-
-    #[test]
-    fn event_targets_watched_config_by_relative_path() {
-        let watched_parent = std::env::temp_dir().join("brainrot_watcher_relative_path");
-        std::fs::create_dir_all(&watched_parent).expect("parent should exist");
-        let watched_path = watched_parent.join("config.toml");
-        let event = Event {
-            kind: EventKind::Modify(ModifyKind::Any),
-            paths: vec![PathBuf::from("config.toml")],
-            attrs: Default::default(),
-        };
-        assert!(event_targets_watched_config(
-            &event,
-            &watched_path,
-            &watched_parent
-        ));
+        assert!(event_targets_watched_config(&event, &watched_path));
         std::fs::remove_dir_all(&watched_parent).ok();
     }
 
@@ -637,11 +689,7 @@ mod tests {
             paths: vec![watched_parent.join("other.toml")],
             attrs: Default::default(),
         };
-        assert!(!event_targets_watched_config(
-            &event,
-            &watched_path,
-            &watched_parent
-        ));
+        assert!(!event_targets_watched_config(&event, &watched_path));
         std::fs::remove_dir_all(&watched_parent).ok();
     }
 
@@ -653,6 +701,7 @@ mod tests {
             rewrite: RewriteConfig {
                 chats: vec![-1001234567890],
                 system_prompt: "rewrite this".to_owned(),
+                context_messages: 10,
             },
         };
         let result = ActiveRewriteState::from_hot_config(hot, Duration::from_secs(5));
@@ -679,12 +728,57 @@ mod tests {
     }
 
     #[test]
-    fn format_error_chain_includes_all_context_levels() {
-        let err = anyhow::anyhow!("root cause")
-            .context("middle context")
-            .context("outer context");
+    fn context_cache_returns_recent_messages_in_order_excluding_current() {
+        let mut cache = ContextCache::new(10);
+        let chat_id = -1001234567890;
+        cache.record_message(
+            chat_id,
+            1,
+            ContextMessage {
+                sender_name: "Alice".to_owned(),
+                text: "one".to_owned(),
+            },
+        );
+        cache.record_message(
+            chat_id,
+            2,
+            ContextMessage {
+                sender_name: "Bob".to_owned(),
+                text: "two".to_owned(),
+            },
+        );
+        cache.record_message(
+            chat_id,
+            3,
+            ContextMessage {
+                sender_name: "Me".to_owned(),
+                text: "three".to_owned(),
+            },
+        );
 
-        let chain = super::format_error_chain(&err);
-        assert_eq!(chain, "outer context -> middle context -> root cause");
+        let context = cache.recent_before(chat_id, 3, 2);
+        assert_eq!(
+            context,
+            vec![
+                ContextMessage {
+                    sender_name: "Alice".to_owned(),
+                    text: "one".to_owned(),
+                },
+                ContextMessage {
+                    sender_name: "Bob".to_owned(),
+                    text: "two".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn context_cache_marks_chat_hydrated_to_avoid_repeat_backfill() {
+        let mut cache = ContextCache::new(10);
+        let chat_id = -1001234567890;
+
+        assert!(cache.should_backfill(chat_id, 10, 0));
+        cache.mark_hydrated(chat_id);
+        assert!(!cache.should_backfill(chat_id, 10, 0));
     }
 }

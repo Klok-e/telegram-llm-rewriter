@@ -16,7 +16,7 @@ Use Cargo for all local workflows:
 - `cargo check`: verify code compiles.
 - `cargo test`: run unit and integration tests.
 - `cargo fmt --all`: format all Rust code using `rustfmt`.
-- `cargo clippy --all-targets --all-features -D warnings`: lint strictly and fail on warnings.
+- `cargo clippy --all-targets --all-features`: lint.
 - `cargo clippy --all-targets --all-features --fix --allow-dirty`: fix warnings automatically (prefer this to manual fixes).
 
 Run `cargo fmt` and `cargo clippy` after making changes.

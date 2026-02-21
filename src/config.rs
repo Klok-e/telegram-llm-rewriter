@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_OLLAMA_TIMEOUT_SECONDS: u64 = 20;
+const DEFAULT_CONTEXT_MESSAGES: usize = 10;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -32,6 +33,8 @@ pub struct OllamaConfig {
 pub struct RewriteConfig {
     pub chats: Vec<i64>,
     pub system_prompt: String,
+    #[serde(default = "default_context_messages")]
+    pub context_messages: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +46,10 @@ pub struct HotConfig {
 
 fn default_ollama_timeout_seconds() -> u64 {
     DEFAULT_OLLAMA_TIMEOUT_SECONDS
+}
+
+fn default_context_messages() -> usize {
+    DEFAULT_CONTEXT_MESSAGES
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,10 +178,9 @@ system_prompt = "rewrite this"
         let config = parse_and_validate_config(VALID_FULL_CONFIG, ConfigMode::Rewrite)
             .expect("config should parse");
         assert_eq!(config.telegram.api_id, 12345);
-        assert_eq!(
-            config.rewrite.expect("rewrite section should exist").chats,
-            vec![-1001234567890]
-        );
+        let rewrite = config.rewrite.expect("rewrite section should exist");
+        assert_eq!(rewrite.chats, vec![-1001234567890]);
+        assert_eq!(rewrite.context_messages, 10);
         assert_eq!(
             config
                 .ollama
@@ -372,6 +378,7 @@ system_prompt = "rewrite this"
             rewrite: super::RewriteConfig {
                 chats: vec![1],
                 system_prompt: "test".into(),
+                context_messages: 10,
             },
         };
         let b = a.clone();
