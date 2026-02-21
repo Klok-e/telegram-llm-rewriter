@@ -242,6 +242,12 @@ async fn run_rewrite_mode(config: &Config, config_path: &Path) -> Result<()> {
                     Ok(Update::NewMessage(message)) => {
                         let chat_id = message.peer_id().bot_api_dialog_id();
                         if bot.is_monitored_chat(chat_id) {
+                            info!(
+                                chat_id,
+                                message_id = message.id(),
+                                outgoing = message.outgoing(),
+                                "received new message in monitored chat"
+                            );
                             context_cache.observe_update_message(chat_id, &message);
                             if let Err(err) = process_message(
                                 &bot,
@@ -327,21 +333,36 @@ async fn process_message(
 
     let message_id = message.id();
     if dedupe_cache.contains(chat_id, message_id) {
-        debug!(chat_id, message_id, "skipping deduped message");
+        info!(chat_id, message_id, "skipping deduped message");
         return Ok(());
     }
 
     let original = message.text().trim().to_owned();
     if original.is_empty() {
-        debug!(chat_id, message_id, "skipping non-text or empty message");
+        info!(chat_id, message_id, "skipping non-text or empty message");
         return Ok(());
     }
 
     let mut context = context_cache.recent_before(chat_id, message_id, rewrite.context_messages);
     if context_cache.should_backfill(chat_id, rewrite.context_messages, context.len()) {
+        info!(
+            chat_id,
+            message_id,
+            requested_context_messages = rewrite.context_messages,
+            cached_context_messages = context.len(),
+            "fetching context messages from telegram"
+        );
         context_cache.mark_hydrated(chat_id);
         match bot.fetch_context(&message, rewrite.context_messages).await {
-            Ok(fetched) => context = fetched,
+            Ok(fetched) => {
+                info!(
+                    chat_id,
+                    message_id,
+                    fetched_context_messages = fetched.len(),
+                    "fetched context messages from telegram"
+                );
+                context = fetched;
+            }
             Err(err) => {
                 warn!(
                     chat_id,
@@ -372,11 +393,11 @@ async fn process_message(
 
     let rewritten = truncate_to_telegram_limit(rewritten.trim(), TELEGRAM_MESSAGE_MAX_CHARS);
     if rewritten.is_empty() {
-        debug!(chat_id, message_id, "skipping empty rewrite result");
+        info!(chat_id, message_id, "skipping empty rewrite result");
         return Ok(());
     }
     if rewritten == original {
-        debug!(chat_id, message_id, "skipping unchanged rewrite result");
+        info!(chat_id, message_id, "skipping unchanged rewrite result");
         return Ok(());
     }
 
