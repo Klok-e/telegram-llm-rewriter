@@ -2,8 +2,9 @@ use crate::config::TelegramConfig;
 use crate::context::{ContextMessage, resolve_sender_name};
 use anyhow::{Context, Result, bail};
 use grammers_client::client::{UpdateStream, UpdatesConfiguration};
+use grammers_client::message::Message as TelegramMessage;
 use grammers_client::update::{Message as UpdateMessage, Update};
-use grammers_client::{Client, SignInError};
+use grammers_client::{Client, SignInError, tl};
 use grammers_mtsender::{SenderPool, SenderPoolFatHandle};
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerRef;
@@ -14,6 +15,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tracing::info;
+
+const CONTEXT_SCAN_FACTOR: usize = 20;
+const CONTEXT_SCAN_MIN_MESSAGES: usize = 200;
+const UPDATE_QUEUE_LIMIT: usize = 10_000;
 
 pub struct TelegramBot {
     client: Client,
@@ -40,6 +45,7 @@ impl TelegramBot {
     pub async fn connect_for_rewrite(
         config: &TelegramConfig,
         monitored_chats: HashSet<i64>,
+        catch_up: bool,
     ) -> Result<Self> {
         let ConnectionParts {
             client,
@@ -47,16 +53,23 @@ impl TelegramBot {
             pool_handle,
             pool_task,
         } = connect_and_auth(config).await?;
+        preflight_monitored_chats(&client, &monitored_chats).await?;
 
         let updates = client
             .stream_updates(
                 updates_rx,
                 UpdatesConfiguration {
-                    catch_up: false,
-                    ..Default::default()
+                    catch_up,
+                    update_queue_limit: Some(UPDATE_QUEUE_LIMIT),
                 },
             )
             .await;
+
+        info!(
+            catch_up,
+            update_queue_limit = UPDATE_QUEUE_LIMIT,
+            "configured telegram update stream"
+        );
 
         Ok(Self {
             client,
@@ -132,6 +145,10 @@ impl TelegramBot {
         self.monitored_chats.contains(&chat_id)
     }
 
+    pub(crate) fn client_clone(&self) -> Client {
+        self.client.clone()
+    }
+
     pub async fn edit_message(&self, message: &UpdateMessage, new_text: &str) -> Result<()> {
         let message_id = message.id();
         let peer = message
@@ -150,6 +167,7 @@ impl TelegramBot {
         &self,
         message: &UpdateMessage,
         count: usize,
+        target_topic_root_id: Option<i32>,
     ) -> Result<Vec<ContextMessage>> {
         if count == 0 {
             return Ok(Vec::new());
@@ -163,13 +181,23 @@ impl TelegramBot {
         let message_id = message.id();
         let mut iter = self.client.iter_messages(peer_ref);
         let mut messages = Vec::new();
+        let max_scan = context_scan_limit(count);
+        let mut scanned = 0;
 
         while let Some(msg) = iter
             .next()
             .await
             .context("failed while iterating messages for context")?
         {
+            scanned += 1;
+            if scanned > max_scan {
+                break;
+            }
+
             if msg.id() == message_id {
+                continue;
+            }
+            if message_topic_root_id(&msg) != target_topic_root_id {
                 continue;
             }
 
@@ -185,6 +213,18 @@ impl TelegramBot {
             if messages.len() >= count {
                 break;
             }
+        }
+
+        if scanned >= max_scan && messages.len() < count {
+            info!(
+                message_id,
+                target_topic_root_id = ?target_topic_root_id,
+                requested_context_messages = count,
+                scanned_messages = scanned,
+                scan_limit = max_scan,
+                fetched_context_messages = messages.len(),
+                "stopped context fetch after scan limit"
+            );
         }
 
         messages.reverse();
@@ -203,6 +243,93 @@ impl TelegramBot {
         }
         Ok(())
     }
+}
+
+async fn preflight_monitored_chats(client: &Client, monitored_chats: &HashSet<i64>) -> Result<()> {
+    let known_chat_ids = prime_dialog_chat_ids(client).await?;
+    let unresolved_chat_ids = unresolved_monitored_chats(monitored_chats, &known_chat_ids);
+    if !unresolved_chat_ids.is_empty() {
+        bail!(
+            "monitored chat ids are not present in Telegram dialogs for this session: {:?}",
+            unresolved_chat_ids
+        );
+    }
+
+    info!(
+        monitored_chat_count = monitored_chats.len(),
+        known_dialog_chat_count = known_chat_ids.len(),
+        "primed telegram peer cache for monitored chats"
+    );
+
+    Ok(())
+}
+
+async fn prime_dialog_chat_ids(client: &Client) -> Result<HashSet<i64>> {
+    let mut dialogs = client.iter_dialogs();
+    let mut chat_ids = HashSet::new();
+    while let Some(dialog) = dialogs
+        .next()
+        .await
+        .context("failed while iterating dialogs for monitored chat preflight")?
+    {
+        chat_ids.insert(dialog.peer_id().bot_api_dialog_id());
+    }
+    Ok(chat_ids)
+}
+
+fn unresolved_monitored_chats(
+    monitored_chats: &HashSet<i64>,
+    known_chat_ids: &HashSet<i64>,
+) -> Vec<i64> {
+    let mut unresolved: Vec<i64> = monitored_chats
+        .iter()
+        .filter(|chat_id| !known_chat_ids.contains(chat_id))
+        .copied()
+        .collect();
+    unresolved.sort_unstable();
+    unresolved
+}
+
+pub fn message_topic_root_id(message: &TelegramMessage) -> Option<i32> {
+    if let Some(reply_header) = message_reply_header(message) {
+        if let Some(top_id) = reply_header.reply_to_top_id {
+            return Some(top_id);
+        }
+        if reply_header.forum_topic {
+            // Some forum-topic replies may not include reply_to_top_id.
+            if let Some(reply_to_id) = reply_header.reply_to_msg_id {
+                return Some(reply_to_id);
+            }
+        }
+    }
+
+    if matches!(
+        message.action(),
+        Some(tl::enums::MessageAction::TopicCreate(_))
+    ) {
+        return Some(message.id());
+    }
+
+    None
+}
+
+fn message_reply_header(message: &TelegramMessage) -> Option<&tl::types::MessageReplyHeader> {
+    let reply_to = match &message.raw {
+        tl::enums::Message::Message(raw) => raw.reply_to.as_ref(),
+        tl::enums::Message::Service(raw) => raw.reply_to.as_ref(),
+        tl::enums::Message::Empty(_) => None,
+    }?;
+
+    match reply_to {
+        tl::enums::MessageReplyHeader::Header(header) => Some(header),
+        tl::enums::MessageReplyHeader::MessageReplyStoryHeader(_) => None,
+    }
+}
+
+fn context_scan_limit(count: usize) -> usize {
+    count
+        .saturating_mul(CONTEXT_SCAN_FACTOR)
+        .max(CONTEXT_SCAN_MIN_MESSAGES)
 }
 
 async fn connect_and_auth(config: &TelegramConfig) -> Result<ConnectionParts> {
@@ -285,4 +412,30 @@ fn prompt(prompt: &str) -> Result<String> {
         .read_line(&mut line)
         .context("failed to read from stdin")?;
     Ok(line.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{context_scan_limit, unresolved_monitored_chats};
+    use std::collections::HashSet;
+
+    #[test]
+    fn context_scan_limit_uses_minimum_window() {
+        assert_eq!(context_scan_limit(1), 200);
+    }
+
+    #[test]
+    fn context_scan_limit_scales_with_requested_context() {
+        assert_eq!(context_scan_limit(20), 400);
+    }
+
+    #[test]
+    fn unresolved_monitored_chats_returns_sorted_missing_chat_ids() {
+        let monitored = HashSet::from([-1003, -1001, -1002]);
+        let known = HashSet::from([-1001]);
+        assert_eq!(
+            unresolved_monitored_chats(&monitored, &known),
+            vec![-1003, -1002]
+        );
+    }
 }

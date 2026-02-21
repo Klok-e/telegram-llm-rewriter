@@ -12,6 +12,7 @@ pub struct Config {
     pub telegram: TelegramConfig,
     pub ollama: Option<OllamaConfig>,
     pub rewrite: Option<RewriteConfig>,
+    pub integration_test: Option<IntegrationTestConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,6 +36,13 @@ pub struct RewriteConfig {
     pub system_prompt: String,
     #[serde(default = "default_context_messages")]
     pub context_messages: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct IntegrationTestConfig {
+    pub chat_id: i64,
+    pub topic_a_root_id: i32,
+    pub topic_b_root_id: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,8 +113,27 @@ fn validate_rewrite_config(config: &RewriteConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_integration_test_config(config: &IntegrationTestConfig) -> Result<()> {
+    if config.chat_id == 0 {
+        bail!("integration_test.chat_id must not be zero");
+    }
+    if config.topic_a_root_id < 0 {
+        bail!("integration_test.topic_a_root_id must be non-negative");
+    }
+    if config.topic_b_root_id < 0 {
+        bail!("integration_test.topic_b_root_id must be non-negative");
+    }
+    if config.topic_a_root_id == config.topic_b_root_id {
+        bail!("integration_test topic ids must be different");
+    }
+    Ok(())
+}
+
 fn validate_config_for_mode(config: &Config, mode: ConfigMode) -> Result<()> {
     validate_telegram_config(&config.telegram)?;
+    if let Some(integration_test) = config.integration_test.as_ref() {
+        validate_integration_test_config(integration_test)?;
+    }
 
     if mode == ConfigMode::Rewrite {
         let ollama = config
@@ -389,5 +416,139 @@ system_prompt = "rewrite this"
             ..a.clone()
         };
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn integration_test_config_parses_when_present() {
+        let with_integration = r#"
+[telegram]
+api_id = 12345
+api_hash = "hash"
+session_file = "session.bin"
+
+[ollama]
+url = "http://localhost:11434"
+model = "llama3"
+
+[rewrite]
+chats = [-1001234567890]
+system_prompt = "rewrite this"
+
+[integration_test]
+chat_id = -1001234567890
+topic_a_root_id = 101
+topic_b_root_id = 202
+"#;
+        let config = parse_and_validate_config(with_integration, ConfigMode::Rewrite)
+            .expect("config with integration_test should parse");
+        let integration = config
+            .integration_test
+            .expect("integration_test section should exist");
+        assert_eq!(integration.chat_id, -1001234567890);
+        assert_eq!(integration.topic_a_root_id, 101);
+        assert_eq!(integration.topic_b_root_id, 202);
+    }
+
+    #[test]
+    fn integration_test_config_allows_general_topic_marker_zero() {
+        let with_integration = r#"
+[telegram]
+api_id = 12345
+api_hash = "hash"
+session_file = "session.bin"
+
+[ollama]
+url = "http://localhost:11434"
+model = "llama3"
+
+[rewrite]
+chats = [-1001234567890]
+system_prompt = "rewrite this"
+
+[integration_test]
+chat_id = -1001234567890
+topic_a_root_id = 0
+topic_b_root_id = 202
+"#;
+        parse_and_validate_config(with_integration, ConfigMode::Rewrite)
+            .expect("topic_*_root_id = 0 should be accepted as general topic marker");
+    }
+
+    #[test]
+    fn integration_test_config_rejects_zero_chat_id() {
+        let with_integration = r#"
+[telegram]
+api_id = 12345
+api_hash = "hash"
+session_file = "session.bin"
+
+[ollama]
+url = "http://localhost:11434"
+model = "llama3"
+
+[rewrite]
+chats = [-1001234567890]
+system_prompt = "rewrite this"
+
+[integration_test]
+chat_id = 0
+topic_a_root_id = 101
+topic_b_root_id = 202
+"#;
+        let err = parse_and_validate_config(with_integration, ConfigMode::Rewrite)
+            .expect_err("config should reject zero integration_test.chat_id");
+        assert!(err.to_string().contains("integration_test.chat_id"));
+    }
+
+    #[test]
+    fn integration_test_config_rejects_identical_topic_ids() {
+        let with_integration = r#"
+[telegram]
+api_id = 12345
+api_hash = "hash"
+session_file = "session.bin"
+
+[ollama]
+url = "http://localhost:11434"
+model = "llama3"
+
+[rewrite]
+chats = [-1001234567890]
+system_prompt = "rewrite this"
+
+[integration_test]
+chat_id = -1001234567890
+topic_a_root_id = 101
+topic_b_root_id = 101
+"#;
+        let err = parse_and_validate_config(with_integration, ConfigMode::Rewrite)
+            .expect_err("config should reject identical integration_test topic ids");
+        assert!(err.to_string().contains("topic ids"));
+    }
+
+    #[test]
+    fn integration_test_config_rejects_negative_topic_id() {
+        let with_integration = r#"
+[telegram]
+api_id = 12345
+api_hash = "hash"
+session_file = "session.bin"
+
+[ollama]
+url = "http://localhost:11434"
+model = "llama3"
+
+[rewrite]
+chats = [-1001234567890]
+system_prompt = "rewrite this"
+
+[integration_test]
+chat_id = -1001234567890
+topic_a_root_id = -1
+topic_b_root_id = 101
+"#;
+        let err = parse_and_validate_config(with_integration, ConfigMode::Rewrite)
+            .expect_err("negative integration_test topic id should fail");
+        assert!(err.to_string().contains("non-negative"));
     }
 }

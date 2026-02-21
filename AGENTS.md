@@ -5,7 +5,6 @@ This repository is a Rust binary crate (`edition = 2024`).
 
 - `src/main.rs`: current application entry point.
 - `Cargo.toml`: package metadata and dependencies.
-- `DESIGN.md`: architecture and design notes; update when behavior or system shape changes.
 - `target/`: Cargo build artifacts (generated, do not edit).
 
 As the project grows, keep runtime code in `src/` modules (for example, `src/bot/`, `src/llm/`) and add integration tests under `tests/`.
@@ -32,10 +31,13 @@ Prefer small modules, explicit types at public boundaries, and `Result`-based er
 
 Use a hard cutover approach and never add backwards compatibility unless approved by user.
 
+After making changes, look at the code again and make sure it doesn't have unnecessary fallbacks, unnecessary complexity, redundancies, and overall code quality isn't horrible.
+
 ## Testing Guidelines
 No coverage gate is configured yet; treat tests as required for new behavior.
 
 - Unit tests: colocate with code using `#[cfg(test)] mod tests`.
 - Integration tests: place in `tests/` with behavior-oriented names (for example, `tests/message_flow.rs`).
+- Note: this agent may be unable to run integration tests in this environment due to sandboxing/permission restrictions.
 
 At minimum, add tests for parsing, branching logic, and error paths introduced by your change.
