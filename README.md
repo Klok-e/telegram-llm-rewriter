@@ -1,6 +1,6 @@
 # brainrot_tg_llm_rewrite
 
-A Telegram **userbot** that intercepts your outgoing messages in configured chats, rewrites them through a local LLM (Ollama), and edits the original message with the rewritten version. The rewrite prompt is fully configurable.
+A Telegram **userbot** that intercepts your outgoing messages in configured chats, rewrites them through the OpenAI Responses API, and edits the original message with the rewritten version. The rewrite prompt is fully configurable.
 
 ## How It Works
 
@@ -11,22 +11,22 @@ You type a message in chat X
 Userbot detects outgoing message in a monitored chat
         │
         ▼
-Original text is sent to Ollama with the configured system prompt
+Original text is sent to OpenAI with the configured system prompt + context
         │
         ▼
-LLM returns rewritten text
+Model returns rewritten text
         │
         ▼
 Userbot edits the original message with the rewritten version
 ```
 
-The user sees their message briefly in its original form, then it gets replaced with the rewritten version within ~1-2 seconds (depending on LLM speed).
+The user sees their message briefly in its original form, then it gets replaced with the rewritten version within ~1-2 seconds (depending on model speed/network).
 
 ## Setup
 
 1. Get `api_id` and `api_hash` from https://my.telegram.org
-2. Create `config.toml` in the working directory (see [Config](#config))
-3. Run [Ollama](https://ollama.com) locally and pull a model (e.g. `ollama pull llama3`)
+2. Get an OpenAI API key
+3. Create `config.toml` in the working directory (see [Config](#config))
 4. `cargo run` — on first launch, the bot will prompt for phone number + login code
 
 ## Config
@@ -39,9 +39,9 @@ api_id = 12345
 api_hash = "your_api_hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-..."
+model = "gpt-4.1-mini"
 timeout_seconds = 20
 
 [rewrite]
@@ -80,8 +80,9 @@ The bot watches `config.toml` for changes at runtime using the `notify` crate. W
 |-------|---------|
 | `system_prompt` | `[rewrite]` |
 | `chats` | `[rewrite]` |
-| `model` | `[ollama]` |
-| `url` | `[ollama]` |
+| `context_messages` | `[rewrite]` |
+| `model` | `[openai]` |
+| `api_key` | `[openai]` |
 
 ### Restart-Required Fields
 
@@ -90,7 +91,7 @@ The bot watches `config.toml` for changes at runtime using the `notify` crate. W
 | `api_id` | `[telegram]` | Bound to the Telegram connection at startup |
 | `api_hash` | `[telegram]` | Bound to the Telegram connection at startup |
 | `session_file` | `[telegram]` | Session is opened once at startup |
-| `timeout_seconds` | `[ollama]` | Baked into the HTTP client at construction |
+| `timeout_seconds` | `[openai]` | Baked into the HTTP client at construction |
 
 ## Architecture
 
@@ -102,7 +103,7 @@ src/
 ├── app.rs           # Shared rewrite runtime loop, hooks, config watching, tracing init
 ├── config.rs        # Config loading & types
 ├── telegram.rs      # Telegram client wrapper (connect, listen, edit)
-└── llm.rs           # Ollama API client
+└── llm.rs           # OpenAI Responses API client
 ```
 
 ### Crate Dependencies
@@ -110,8 +111,9 @@ src/
 | Crate | Purpose |
 |-------|---------|
 | `grammers-client` + `grammers-session` | Telegram MTProto client & session persistence |
-| `reqwest` | HTTP client for Ollama API |
-| `serde` / `serde_json` | JSON (de)serialization for Ollama API |
+| `async-openai` | OpenAI API client |
+| `reqwest` | Custom HTTP client timeout for OpenAI |
+| `serde` | Config (de)serialization |
 | `toml` | Config file parsing |
 | `tokio` | Async runtime |
 | `tracing` + `tracing-subscriber` + `tracing-log` | Logging |
@@ -122,7 +124,7 @@ src/
 
 2. **Edit-in-place, not delete+resend** — Editing preserves message ordering, reply chains, and doesn't trigger extra notifications. Downside: there's a brief window where the original text is visible.
 
-3. **Ollama over cloud APIs** — No API keys, no costs, full privacy. Runs locally. The user can swap models freely.
+3. **OpenAI Responses API** — Unified API surface and broad model availability through one provider integration.
 
 4. **TOML config + focused CLI flags** — Rewrite behavior lives in TOML, while discovery/setup uses simple flags (`--config`, `--list-chats`).
 

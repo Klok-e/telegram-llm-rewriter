@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use brainrot_tg_llm_rewrite::app::{
     RewriteEvent, RewriteHooks, RewriteRuntimeOptions, run_rewrite_mode_with_shutdown_and_hooks,
 };
-use brainrot_tg_llm_rewrite::config::{Config, ConfigMode, load_config_for_mode};
+use brainrot_tg_llm_rewrite::config::{
+    Config, ConfigMode, OpenAiConfig, RewriteConfig, load_config_for_mode,
+};
 use grammers_client::Client;
 use grammers_client::message::InputMessage;
 use grammers_session::types::PeerRef;
@@ -16,6 +18,9 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const TEST_REWRITE_TEXT: &str = "[it-edited]";
+const TEST_DEFAULT_OPENAI_API_KEY: &str = "test-openai-key";
+const TEST_DEFAULT_OPENAI_MODEL: &str = "gpt-4.1-mini";
+const TEST_DEFAULT_CONTEXT_MESSAGES: usize = 10;
 
 #[derive(Debug, Clone)]
 struct SentMessage {
@@ -24,10 +29,10 @@ struct SentMessage {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires real Telegram/Ollama with configured [integration_test] in config.toml"]
+#[ignore = "requires real Telegram/OpenAI with configured [integration_test] in config.toml"]
 async fn topic_burst_messages_are_all_processed() -> Result<()> {
     let config_path = std::path::PathBuf::from(CONFIG_PATH);
-    let base_config = load_config_for_mode(&config_path, ConfigMode::Rewrite)
+    let base_config = load_config_for_mode(&config_path, ConfigMode::ListChats)
         .with_context(|| format!("failed to load config at {}", config_path.display()))?;
     let integration = base_config
         .integration_test
@@ -35,7 +40,7 @@ async fn topic_burst_messages_are_all_processed() -> Result<()> {
         .context("missing [integration_test] section in config.toml")?
         .clone();
 
-    let runtime_config = ensure_chat_monitored(&base_config, integration.chat_id)?;
+    let runtime_config = ensure_override_runtime_config(&base_config, integration.chat_id)?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RewriteEvent>();
     let (client_tx, client_rx) = oneshot::channel::<Client>();
@@ -169,12 +174,31 @@ async fn topic_burst_messages_are_all_processed() -> Result<()> {
     Ok(())
 }
 
-fn ensure_chat_monitored(config: &Config, chat_id: i64) -> Result<Config> {
+fn ensure_override_runtime_config(config: &Config, chat_id: i64) -> Result<Config> {
     let mut runtime_config = config.clone();
-    let rewrite = runtime_config
-        .rewrite
-        .as_mut()
-        .context("missing required [rewrite] section for rewrite mode")?;
+    let openai = runtime_config.openai.get_or_insert_with(|| OpenAiConfig {
+        api_key: TEST_DEFAULT_OPENAI_API_KEY.to_owned(),
+        model: TEST_DEFAULT_OPENAI_MODEL.to_owned(),
+        timeout_seconds: 20,
+    });
+    if openai.api_key.trim().is_empty() {
+        openai.api_key = TEST_DEFAULT_OPENAI_API_KEY.to_owned();
+    }
+    if openai.model.trim().is_empty() {
+        openai.model = TEST_DEFAULT_OPENAI_MODEL.to_owned();
+    }
+
+    let rewrite = runtime_config.rewrite.get_or_insert_with(|| RewriteConfig {
+        chats: Vec::new(),
+        system_prompt: "rewrite".to_owned(),
+        context_messages: TEST_DEFAULT_CONTEXT_MESSAGES,
+    });
+    if rewrite.system_prompt.trim().is_empty() {
+        rewrite.system_prompt = "rewrite".to_owned();
+    }
+    if rewrite.context_messages == 0 {
+        rewrite.context_messages = TEST_DEFAULT_CONTEXT_MESSAGES;
+    }
     if !rewrite.chats.contains(&chat_id) {
         rewrite.chats.push(chat_id);
     }
@@ -335,26 +359,30 @@ fn unique_run_id() -> String {
 }
 
 #[test]
-fn ensure_chat_monitored_adds_target_chat_when_missing() {
+fn ensure_override_runtime_config_adds_target_chat_and_defaults() {
     let source = r#"
 [telegram]
 api_id = 1
 api_hash = "hash"
 session_file = "session.sqlite3"
 
-[ollama]
-url = "http://localhost:11434"
-model = "x"
-
 [rewrite]
 chats = [-1001]
-system_prompt = "rewrite"
+system_prompt = ""
 "#;
 
     let config: Config = toml::from_str(source).expect("fixture TOML should deserialize as Config");
 
-    let adjusted = ensure_chat_monitored(&config, -1002).expect("chat should be injected");
-    let chats = adjusted.rewrite.expect("rewrite section must exist").chats;
+    let adjusted = ensure_override_runtime_config(&config, -1002)
+        .expect("runtime config should be normalized for override mode");
+    let openai = adjusted.openai.expect("openai section must exist");
+    assert_eq!(openai.api_key, TEST_DEFAULT_OPENAI_API_KEY);
+    assert_eq!(openai.model, TEST_DEFAULT_OPENAI_MODEL);
+
+    let rewrite = adjusted.rewrite.expect("rewrite section must exist");
+    assert_eq!(rewrite.system_prompt, "rewrite");
+    assert_eq!(rewrite.context_messages, TEST_DEFAULT_CONTEXT_MESSAGES);
+    let chats = rewrite.chats;
     assert!(chats.contains(&-1001));
     assert!(chats.contains(&-1002));
 }

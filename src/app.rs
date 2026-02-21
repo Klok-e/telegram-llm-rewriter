@@ -1,6 +1,6 @@
 use crate::config::{Config, HotConfig, RewriteConfig, extract_hot_config, load_hot_config};
 use crate::context::{ContextMessage, resolve_sender_name};
-use crate::llm::OllamaClient;
+use crate::llm::OpenAiClient;
 use crate::telegram::{TelegramBot, message_topic_root_id};
 use anyhow::{Context, Result};
 use grammers_client::Client;
@@ -142,7 +142,7 @@ pub async fn run_rewrite_mode_with_shutdown_and_hooks<S>(
 where
     S: Future<Output = ()> + Send,
 {
-    let timeout = Duration::from_secs(config.ollama_required()?.timeout_seconds);
+    let timeout = Duration::from_secs(config.openai_required()?.timeout_seconds);
     let mut active = ActiveRewriteState::from_hot_config(extract_hot_config(config)?, timeout)?;
     let catch_up_enabled = runtime_options.catch_up_enabled;
     let skip_historical_catch_up_messages = runtime_options.skip_historical_catch_up_messages;
@@ -274,8 +274,7 @@ where
                         context_cache.retain_chats(&new_active.monitored_chats);
                         context_cache.set_per_chat_limit(new_active.hot_config.rewrite.context_messages);
                         info!(
-                            model = %new_active.hot_config.ollama_model,
-                            url = %new_active.hot_config.ollama_url,
+                            model = %new_active.hot_config.openai_model,
                             chats = ?new_active.hot_config.rewrite.chats,
                             "config reloaded"
                         );
@@ -297,15 +296,15 @@ where
 struct ActiveRewriteState {
     hot_config: HotConfig,
     monitored_chats: HashSet<i64>,
-    llm: OllamaClient,
+    llm: OpenAiClient,
 }
 
 impl ActiveRewriteState {
     fn from_hot_config(hot_config: HotConfig, timeout: Duration) -> Result<Self> {
         let monitored_chats: HashSet<i64> = hot_config.rewrite.chats.iter().copied().collect();
-        let llm = OllamaClient::new(
-            hot_config.ollama_url.clone(),
-            hot_config.ollama_model.clone(),
+        let llm = OpenAiClient::new(
+            hot_config.openai_api_key.clone(),
+            hot_config.openai_model.clone(),
             timeout,
         )?;
 
@@ -451,7 +450,7 @@ fn update_kind_name(update: &Update) -> String {
 
 async fn process_message(
     bot: &TelegramBot,
-    llm: &OllamaClient,
+    llm: &OpenAiClient,
     rewrite: &RewriteConfig,
     message: UpdateMessage,
     context_scope: ContextScope,
@@ -564,7 +563,7 @@ async fn process_message(
                     chat_id,
                     message_id,
                     error = %err,
-                    "ollama rewrite failed; leaving original message unchanged"
+                    "openai rewrite failed; leaving original message unchanged"
                 );
                 return Ok(());
             }
@@ -845,10 +844,10 @@ mod tests {
     }
 
     #[test]
-    fn active_rewrite_state_rejects_invalid_ollama_url() {
+    fn active_rewrite_state_rejects_empty_openai_api_key() {
         let hot = HotConfig {
-            ollama_url: "not-a-url".to_owned(),
-            ollama_model: "llama3".to_owned(),
+            openai_api_key: "   ".to_owned(),
+            openai_model: "gpt-4.1-mini".to_owned(),
             rewrite: RewriteConfig {
                 chats: vec![-1001234567890],
                 system_prompt: "rewrite this".to_owned(),
@@ -856,12 +855,12 @@ mod tests {
             },
         };
         let result = ActiveRewriteState::from_hot_config(hot, Duration::from_secs(5));
-        assert!(result.is_err(), "invalid URL should fail");
+        assert!(result.is_err(), "empty api key should fail");
         let err = match result {
             Ok(_) => unreachable!("checked above"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("valid URL"));
+        assert!(err.to_string().contains("api key"));
     }
 
     #[test]

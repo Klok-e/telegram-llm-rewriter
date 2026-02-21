@@ -1,16 +1,15 @@
 use anyhow::{Context, Result, bail};
-use reqwest::Url;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_OLLAMA_TIMEOUT_SECONDS: u64 = 20;
+const DEFAULT_OPENAI_TIMEOUT_SECONDS: u64 = 20;
 const DEFAULT_CONTEXT_MESSAGES: usize = 10;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub telegram: TelegramConfig,
-    pub ollama: Option<OllamaConfig>,
+    pub openai: Option<OpenAiConfig>,
     pub rewrite: Option<RewriteConfig>,
     pub integration_test: Option<IntegrationTestConfig>,
 }
@@ -23,10 +22,10 @@ pub struct TelegramConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct OllamaConfig {
-    pub url: String,
+pub struct OpenAiConfig {
+    pub api_key: String,
     pub model: String,
-    #[serde(default = "default_ollama_timeout_seconds")]
+    #[serde(default = "default_openai_timeout_seconds")]
     pub timeout_seconds: u64,
 }
 
@@ -47,13 +46,13 @@ pub struct IntegrationTestConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HotConfig {
-    pub ollama_url: String,
-    pub ollama_model: String,
+    pub openai_api_key: String,
+    pub openai_model: String,
     pub rewrite: RewriteConfig,
 }
 
-fn default_ollama_timeout_seconds() -> u64 {
-    DEFAULT_OLLAMA_TIMEOUT_SECONDS
+fn default_openai_timeout_seconds() -> u64 {
+    DEFAULT_OPENAI_TIMEOUT_SECONDS
 }
 
 fn default_context_messages() -> usize {
@@ -91,14 +90,12 @@ fn validate_telegram_config(config: &TelegramConfig) -> Result<()> {
     Ok(())
 }
 
-fn validate_ollama_config(config: &OllamaConfig) -> Result<()> {
-    let url = config.url.trim();
-    if url.is_empty() {
-        bail!("ollama.url must not be empty");
+fn validate_openai_config(config: &OpenAiConfig) -> Result<()> {
+    if config.api_key.trim().is_empty() {
+        bail!("openai.api_key must not be empty");
     }
-    Url::parse(url).context("ollama.url must be a valid URL string")?;
     if config.model.trim().is_empty() {
-        bail!("ollama.model must not be empty");
+        bail!("openai.model must not be empty");
     }
     Ok(())
 }
@@ -136,11 +133,11 @@ fn validate_config_for_mode(config: &Config, mode: ConfigMode) -> Result<()> {
     }
 
     if mode == ConfigMode::Rewrite {
-        let ollama = config
-            .ollama
+        let openai = config
+            .openai
             .as_ref()
-            .context("missing required [ollama] section for rewrite mode")?;
-        validate_ollama_config(ollama)?;
+            .context("missing required [openai] section for rewrite mode")?;
+        validate_openai_config(openai)?;
 
         let rewrite = config
             .rewrite
@@ -153,10 +150,10 @@ fn validate_config_for_mode(config: &Config, mode: ConfigMode) -> Result<()> {
 }
 
 impl Config {
-    pub fn ollama_required(&self) -> Result<&OllamaConfig> {
-        self.ollama
+    pub fn openai_required(&self) -> Result<&OpenAiConfig> {
+        self.openai
             .as_ref()
-            .context("missing required [ollama] section")
+            .context("missing required [openai] section")
     }
 
     pub fn rewrite_required(&self) -> Result<&RewriteConfig> {
@@ -167,11 +164,11 @@ impl Config {
 }
 
 pub fn extract_hot_config(config: &Config) -> Result<HotConfig> {
-    let ollama = config.ollama_required()?;
+    let openai = config.openai_required()?;
     let rewrite = config.rewrite_required()?;
     Ok(HotConfig {
-        ollama_url: ollama.url.clone(),
-        ollama_model: ollama.model.clone(),
+        openai_api_key: openai.api_key.clone(),
+        openai_model: openai.model.clone(),
         rewrite: rewrite.clone(),
     })
 }
@@ -191,9 +188,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-test"
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = [-1001234567890]
@@ -210,8 +207,8 @@ system_prompt = "rewrite this"
         assert_eq!(rewrite.context_messages, 10);
         assert_eq!(
             config
-                .ollama
-                .expect("ollama section should exist")
+                .openai
+                .expect("openai section should exist")
                 .timeout_seconds,
             20
         );
@@ -225,8 +222,8 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
+[openai]
+api_key = "sk-test"
 
 [rewrite]
 chats = [-1001234567890]
@@ -244,9 +241,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-test"
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = []
@@ -278,7 +275,7 @@ session_file = "session.bin"
     }
 
     #[test]
-    fn rewrite_mode_requires_ollama_and_rewrite_sections() {
+    fn rewrite_mode_requires_openai_and_rewrite_sections() {
         let telegram_only = r#"
 [telegram]
 api_id = 12345
@@ -288,7 +285,7 @@ session_file = "session.bin"
 
         let err = parse_and_validate_config(telegram_only, ConfigMode::Rewrite)
             .expect_err("rewrite mode should require more than telegram section");
-        assert!(err.to_string().contains("[ollama]"));
+        assert!(err.to_string().contains("[openai]"));
     }
 
     #[test]
@@ -296,8 +293,8 @@ session_file = "session.bin"
         let config = parse_and_validate_config(VALID_FULL_CONFIG, ConfigMode::Rewrite)
             .expect("config should parse");
         let hot = super::extract_hot_config(&config).expect("should extract hot config");
-        assert_eq!(hot.ollama_url, "http://localhost:11434");
-        assert_eq!(hot.ollama_model, "llama3");
+        assert_eq!(hot.openai_api_key, "sk-test");
+        assert_eq!(hot.openai_model, "gpt-4.1-mini");
         assert_eq!(hot.rewrite.chats, vec![-1001234567890]);
         assert_eq!(hot.rewrite.system_prompt, "rewrite this");
     }
@@ -310,8 +307,8 @@ session_file = "session.bin"
         std::fs::write(&path, VALID_FULL_CONFIG).unwrap();
 
         let hot = super::load_hot_config(&path).expect("should load hot config");
-        assert_eq!(hot.ollama_url, "http://localhost:11434");
-        assert_eq!(hot.ollama_model, "llama3");
+        assert_eq!(hot.openai_api_key, "sk-test");
+        assert_eq!(hot.openai_model, "gpt-4.1-mini");
         assert_eq!(hot.rewrite.system_prompt, "rewrite this");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -328,8 +325,8 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
+[openai]
+api_key = "sk-test"
 
 [rewrite]
 chats = [-1001234567890]
@@ -354,9 +351,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-test"
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = [-1001234567890]
@@ -371,8 +368,8 @@ system_prompt = "   "
     }
 
     #[test]
-    fn load_hot_config_rejects_invalid_url() {
-        let dir = std::env::temp_dir().join("brainrot_test_hot_invalid_url");
+    fn load_hot_config_rejects_empty_api_key() {
+        let dir = std::env::temp_dir().join("brainrot_test_hot_empty_api_key");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         let invalid = r#"
@@ -381,9 +378,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "not-a-url"
-model = "llama3"
+[openai]
+api_key = "   "
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = [-1001234567890]
@@ -392,7 +389,7 @@ system_prompt = "rewrite this"
         std::fs::write(&path, invalid).unwrap();
 
         let err = super::load_hot_config(&path).expect_err("should fail");
-        assert!(err.to_string().contains("valid URL"));
+        assert!(err.to_string().contains("openai.api_key"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -400,8 +397,8 @@ system_prompt = "rewrite this"
     #[test]
     fn hot_config_partial_eq() {
         let a = super::HotConfig {
-            ollama_url: "http://localhost:11434".into(),
-            ollama_model: "llama3".into(),
+            openai_api_key: "sk-test".into(),
+            openai_model: "gpt-4.1-mini".into(),
             rewrite: super::RewriteConfig {
                 chats: vec![1],
                 system_prompt: "test".into(),
@@ -412,7 +409,7 @@ system_prompt = "rewrite this"
         assert_eq!(a, b);
 
         let c = super::HotConfig {
-            ollama_model: "gemma".into(),
+            openai_model: "gpt-4.1".into(),
             ..a.clone()
         };
         assert_ne!(a, c);
@@ -426,9 +423,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-test"
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = [-1001234567890]
@@ -457,9 +454,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-test"
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = [-1001234567890]
@@ -482,9 +479,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-test"
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = [-1001234567890]
@@ -508,9 +505,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-test"
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = [-1001234567890]
@@ -534,9 +531,9 @@ api_id = 12345
 api_hash = "hash"
 session_file = "session.bin"
 
-[ollama]
-url = "http://localhost:11434"
-model = "llama3"
+[openai]
+api_key = "sk-test"
+model = "gpt-4.1-mini"
 
 [rewrite]
 chats = [-1001234567890]
