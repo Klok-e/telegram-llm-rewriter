@@ -4,6 +4,12 @@ pub struct ContextMessage {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextEntry {
+    pub message_id: i32,
+    pub message: ContextMessage,
+}
+
 impl ContextMessage {
     pub fn as_llm_user_content(&self) -> String {
         format!("{}: {}", self.sender_name, self.text)

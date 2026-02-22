@@ -1,5 +1,5 @@
 use crate::config::TelegramConfig;
-use crate::context::{ContextMessage, resolve_sender_name};
+use crate::context::{ContextEntry, ContextMessage, resolve_sender_name};
 use anyhow::{Context, Result, bail};
 use grammers_client::client::{UpdateStream, UpdatesConfiguration};
 use grammers_client::message::Message as TelegramMessage;
@@ -168,7 +168,7 @@ impl TelegramBot {
         message: &UpdateMessage,
         count: usize,
         target_topic_root_id: Option<i32>,
-    ) -> Result<Vec<ContextMessage>> {
+    ) -> Result<Vec<ContextEntry>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -206,9 +206,13 @@ impl TelegramBot {
                 continue;
             }
 
+            let msg_id = msg.id();
             let peer_name = msg.sender().and_then(|p| p.name().map(str::to_owned));
             let sender_name = resolve_sender_name(msg.outgoing(), peer_name.as_deref());
-            messages.push(ContextMessage { sender_name, text });
+            messages.push(ContextEntry {
+                message_id: msg_id,
+                message: ContextMessage { sender_name, text },
+            });
 
             if messages.len() >= count {
                 break;

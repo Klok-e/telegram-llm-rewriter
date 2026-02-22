@@ -1,5 +1,5 @@
 use crate::config::{Config, HotConfig, RewriteConfig, extract_hot_config, load_hot_config};
-use crate::context::{ContextMessage, resolve_sender_name};
+use crate::context::{ContextEntry, ContextMessage, resolve_sender_name};
 use crate::llm::OpenAiClient;
 use crate::telegram::{TelegramBot, message_topic_root_id};
 use anyhow::{Context, Result};
@@ -92,16 +92,6 @@ pub struct RewriteRuntimeOptions {
     pub rewrite_override: Option<String>,
 }
 
-impl RewriteRuntimeOptions {
-    fn from_env() -> Self {
-        Self {
-            catch_up_enabled: should_enable_catch_up(),
-            skip_historical_catch_up_messages: should_skip_historical_catch_up_messages(),
-            rewrite_override: test_rewrite_override(),
-        }
-    }
-}
-
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 
 pub fn init_tracing() {
@@ -127,7 +117,11 @@ pub async fn run_rewrite_mode(config: &Config, config_path: &Path) -> Result<()>
             }
         },
         RewriteHooks::default(),
-        RewriteRuntimeOptions::from_env(),
+        RewriteRuntimeOptions {
+            catch_up_enabled: true,
+            skip_historical_catch_up_messages: true,
+            rewrite_override: None,
+        },
     )
     .await
 }
@@ -197,7 +191,6 @@ where
                             };
                             let message_id = message.id();
                             let message_unix = message.date().timestamp();
-                            context_cache.observe_update_message(context_scope, &message);
                             if skip_historical_catch_up_messages && is_historical_catch_up_message(
                                 message_unix,
                                 startup_unix
@@ -419,14 +412,6 @@ fn is_historical_catch_up_message(message_unix: i64, startup_unix: i64) -> bool 
     message_unix < startup_unix
 }
 
-fn should_skip_historical_catch_up_messages() -> bool {
-    std::env::var_os("BRAINROT_DISABLE_HISTORICAL_SKIP").is_none()
-}
-
-fn should_enable_catch_up() -> bool {
-    std::env::var_os("BRAINROT_TEST_DISABLE_CATCH_UP").is_none()
-}
-
 fn update_kind_name(update: &Update) -> String {
     match update {
         Update::NewMessage(_) => "new_message".to_owned(),
@@ -459,6 +444,9 @@ async fn process_message(
     let chat_id = context_scope.chat_id;
     let topic_root_id = context_scope.topic_root_id;
     if !message.outgoing() {
+        runtime
+            .context_cache
+            .observe_update_message(context_scope, &message);
         return Ok(());
     }
 
@@ -490,7 +478,6 @@ async fn process_message(
             cached_context_messages = context.len(),
             "fetching context messages from telegram"
         );
-        runtime.context_cache.mark_hydrated(context_scope);
         match bot
             .fetch_context(&message, rewrite.context_messages, topic_root_id)
             .await
@@ -503,7 +490,9 @@ async fn process_message(
                     fetched_context_messages = fetched.len(),
                     "fetched context messages from telegram"
                 );
-                context = fetched;
+                runtime.context_cache.mark_hydrated(context_scope);
+                context = fetched.iter().map(|entry| entry.message.clone()).collect();
+                runtime.context_cache.backfill(context_scope, fetched);
             }
             Err(err) => {
                 warn!(
@@ -565,6 +554,9 @@ async fn process_message(
                     error = %err,
                     "openai rewrite failed; leaving original message unchanged"
                 );
+                runtime
+                    .context_cache
+                    .observe_update_message(context_scope, &message);
                 return Ok(());
             }
         }
@@ -573,15 +565,24 @@ async fn process_message(
     let rewritten = truncate_to_telegram_limit(rewritten.trim(), TELEGRAM_MESSAGE_MAX_CHARS);
     if rewritten.is_empty() {
         info!(chat_id, message_id, "skipping empty rewrite result");
+        runtime
+            .context_cache
+            .observe_update_message(context_scope, &message);
         return Ok(());
     }
     if rewritten == original {
         info!(chat_id, message_id, "skipping unchanged rewrite result");
+        runtime
+            .context_cache
+            .observe_update_message(context_scope, &message);
         return Ok(());
     }
 
     match bot.edit_message(&message, rewritten).await {
         Ok(()) => {
+            runtime
+                .context_cache
+                .upsert_update_message_text(context_scope, &message, rewritten);
             runtime.dedupe_cache.insert(chat_id, message_id);
             info!(chat_id, message_id, "rewrote and edited message");
             runtime.hooks.emit(RewriteEvent::MessageEdited {
@@ -598,6 +599,9 @@ async fn process_message(
                 error = %err,
                 "failed to edit message; continuing"
             );
+            runtime
+                .context_cache
+                .observe_update_message(context_scope, &message);
         }
     }
 
@@ -611,20 +615,10 @@ struct ProcessMessageRuntime<'a> {
     hooks: &'a RewriteHooks,
 }
 
-fn test_rewrite_override() -> Option<String> {
-    std::env::var("BRAINROT_TEST_BYPASS_REWRITE").ok()
-}
-
 fn normalize_rewrite_override(rewrite_override: Option<String>) -> Option<String> {
     rewrite_override
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-}
-
-#[derive(Clone)]
-struct CachedContextMessage {
-    message_id: i32,
-    message: ContextMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -635,7 +629,7 @@ struct ContextScope {
 
 struct ContextCache {
     per_chat_limit: usize,
-    entries: HashMap<ContextScope, VecDeque<CachedContextMessage>>,
+    entries: HashMap<ContextScope, VecDeque<ContextEntry>>,
     hydrated_scopes: HashSet<ContextScope>,
 }
 
@@ -675,21 +669,60 @@ impl ContextCache {
         self.record_message(scope, message.id(), ContextMessage { sender_name, text });
     }
 
+    fn upsert_update_message_text(
+        &mut self,
+        scope: ContextScope,
+        message: &UpdateMessage,
+        text: &str,
+    ) {
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+
+        let peer_name = message.sender().and_then(|p| p.name().map(str::to_owned));
+        let sender_name = resolve_sender_name(message.outgoing(), peer_name.as_deref());
+        self.upsert_message(scope, message.id(), ContextMessage { sender_name, text });
+    }
+
     fn record_message(&mut self, scope: ContextScope, message_id: i32, message: ContextMessage) {
         let chat_messages = self.entries.entry(scope).or_default();
         if chat_messages
             .iter()
-            .any(|cached| cached.message_id == message_id)
+            .any(|entry| entry.message_id == message_id)
         {
             return;
         }
-        chat_messages.push_back(CachedContextMessage {
+        chat_messages.push_back(ContextEntry {
             message_id,
             message,
         });
         while chat_messages.len() > self.per_chat_limit {
             chat_messages.pop_front();
         }
+    }
+
+    fn upsert_message(&mut self, scope: ContextScope, message_id: i32, message: ContextMessage) {
+        let chat_messages = self.entries.entry(scope).or_default();
+        if let Some(entry) = chat_messages
+            .iter_mut()
+            .find(|entry| entry.message_id == message_id)
+        {
+            entry.message = message;
+            return;
+        }
+        chat_messages.push_back(ContextEntry {
+            message_id,
+            message,
+        });
+        while chat_messages.len() > self.per_chat_limit {
+            chat_messages.pop_front();
+        }
+    }
+
+    fn backfill(&mut self, scope: ContextScope, messages: Vec<ContextEntry>) {
+        let fresh: VecDeque<ContextEntry> = messages.into_iter().collect();
+        self.entries.insert(scope, fresh);
     }
 
     fn recent_before(
@@ -704,11 +737,11 @@ impl ContextCache {
 
         let mut recent = Vec::with_capacity(count);
         if let Some(messages) = self.entries.get(&scope) {
-            for cached in messages.iter().rev() {
-                if cached.message_id == message_id {
+            for entry in messages.iter().rev() {
+                if entry.message_id == message_id {
                     continue;
                 }
-                recent.push(cached.message.clone());
+                recent.push(entry.message.clone());
                 if recent.len() >= count {
                     break;
                 }
@@ -727,11 +760,11 @@ impl ContextCache {
     }
 }
 
-fn truncate_to_telegram_limit(input: &str, max_utf16_units: usize) -> &str {
-    let mut utf16_count = 0;
-    for (byte_offset, ch) in input.char_indices() {
-        utf16_count += ch.len_utf16();
-        if utf16_count > max_utf16_units {
+fn truncate_to_telegram_limit(input: &str, max_chars: usize) -> &str {
+    let mut char_count = 0;
+    for (byte_offset, _) in input.char_indices() {
+        char_count += 1;
+        if char_count > max_chars {
             return &input[..byte_offset];
         }
     }
@@ -774,7 +807,7 @@ mod tests {
         truncate_to_telegram_limit, update_kind_name,
     };
     use crate::config::{HotConfig, RewriteConfig};
-    use crate::context::ContextMessage;
+    use crate::context::{ContextEntry, ContextMessage};
     use grammers_client::tl;
     use grammers_client::update::Update;
     use notify::{
@@ -1014,9 +1047,9 @@ mod tests {
     }
 
     #[test]
-    fn truncate_counts_utf16_code_units_not_scalar_values() {
+    fn truncate_counts_unicode_scalar_values() {
         let input = "😀😀😀😀";
-        let result = truncate_to_telegram_limit(input, 6);
+        let result = truncate_to_telegram_limit(input, 3);
         assert_eq!(result, "😀😀😀");
     }
 
@@ -1029,7 +1062,7 @@ mod tests {
     #[test]
     fn truncate_mixed_bmp_and_surrogate_pairs() {
         let input = "a😀a";
-        let result = truncate_to_telegram_limit(input, 3);
+        let result = truncate_to_telegram_limit(input, 2);
         assert_eq!(result, "a😀");
     }
 
@@ -1074,6 +1107,91 @@ mod tests {
         );
         assert_eq!(context[0].text, "first");
         assert_eq!(context[1].text, "second");
+    }
+
+    #[test]
+    fn context_cache_reobserve_after_backfill_preserves_current_message() {
+        let mut cache = ContextCache::new(10);
+        let scope = ContextScope {
+            chat_id: -1001234567890,
+            topic_root_id: Some(123),
+        };
+
+        cache.record_message(
+            scope,
+            200,
+            ContextMessage {
+                sender_name: "Me".to_owned(),
+                text: "current".to_owned(),
+            },
+        );
+        cache.backfill(
+            scope,
+            vec![
+                ContextEntry {
+                    message_id: 180,
+                    message: ContextMessage {
+                        sender_name: "Alice".to_owned(),
+                        text: "old one".to_owned(),
+                    },
+                },
+                ContextEntry {
+                    message_id: 190,
+                    message: ContextMessage {
+                        sender_name: "Bob".to_owned(),
+                        text: "old two".to_owned(),
+                    },
+                },
+            ],
+        );
+        cache.record_message(
+            scope,
+            200,
+            ContextMessage {
+                sender_name: "Me".to_owned(),
+                text: "current".to_owned(),
+            },
+        );
+
+        let context = cache.recent_before(scope, 201, 10);
+        assert_eq!(
+            context.into_iter().map(|msg| msg.text).collect::<Vec<_>>(),
+            vec![
+                "old one".to_owned(),
+                "old two".to_owned(),
+                "current".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn upsert_message_replaces_cached_text_for_same_message_id() {
+        let mut cache = ContextCache::new(10);
+        let scope = ContextScope {
+            chat_id: -1001234567890,
+            topic_root_id: None,
+        };
+
+        cache.record_message(
+            scope,
+            1,
+            ContextMessage {
+                sender_name: "Me".to_owned(),
+                text: "original".to_owned(),
+            },
+        );
+        cache.upsert_message(
+            scope,
+            1,
+            ContextMessage {
+                sender_name: "Me".to_owned(),
+                text: "rewritten".to_owned(),
+            },
+        );
+
+        let context = cache.recent_before(scope, 99, 10);
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].text, "rewritten");
     }
 
     #[test]
