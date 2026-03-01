@@ -1,10 +1,13 @@
 use crate::context::ContextMessage;
 use anyhow::{Context, Result, bail};
-use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, InputItem, InputParam, MessageType,
     OutputItem, OutputMessageContent, Role,
+};
+use async_openai::{
+    Client,
+    types::responses::{Reasoning, ReasoningEffort},
 };
 use std::time::Duration;
 use tracing::debug;
@@ -97,6 +100,10 @@ fn build_response_request(
     CreateResponse {
         model: Some(model.to_owned()),
         input: InputParam::Items(items),
+        reasoning: Some(Reasoning {
+            effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
